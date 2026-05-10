@@ -1,0 +1,32 @@
+#######################################
+# Syntax Coloring Map for ESP32WiFiPortal
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+ESP32WiFiPortal	KEYWORD1
+WiFiPortalMode	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+loop	KEYWORD2
+getMode	KEYWORD2
+isConnected	KEYWORD2
+getIP	KEYWORD2
+server	KEYWORD2
+on	KEYWORD2
+setLedPin	KEYWORD2
+setHtmlPath	KEYWORD2
+setConfigPath	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+AccessPoint	LITERAL1
+Connected	LITERAL1

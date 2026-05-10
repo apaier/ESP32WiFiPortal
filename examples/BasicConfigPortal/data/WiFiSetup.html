@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiFi Setup</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Arial,sans-serif;padding:.5rem;text-align:center}form{display:flex;flex-direction:column;gap:.5rem;align-items:center;width:100%;max-width:300px;margin:0 auto}h1{font-size:1.5rem;margin:.5rem 0}p{font-size:.9rem;margin:.3rem 0}label{display:block;font-weight:500;margin-top:.3rem;text-align:left}select,input{width:100%;padding:.5rem;font-size:1rem;border:1px solid #ccc;border-radius:3px}input[type=submit]{background:#4CAF50;color:white;border:none;cursor:pointer;font-weight:bold;transition:background .3s}input[type=submit]:hover{background:#45a049}a{color:#4CAF50;text-decoration:none}@media(max-width:480px){h1{font-size:1.2rem}p{font-size:.85rem}select,input{padding:.4rem;font-size:.95rem}}</style>
+</head>
+<body>
+<h1>WiFi Setup</h1>
+<p>Choose a network to connect this device to.</p>
+<p><a href=".">Reload</a></p>
+<p>***Connection Status***</p>
+<form action="wifi" method="get">
+<label for="network">Network:</label>
+<select name="network" id="network"><option>--Select Network--</option>***options***</select>
+<label for="password">Password:</label>
+<input name="password" id="password" type="text" placeholder="WiFi password">
+<input type="submit" value="Connect">
+</form>
+</body>
+</html>
