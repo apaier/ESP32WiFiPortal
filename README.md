@@ -10,6 +10,10 @@ A reusable WiFi configuration portal for ESP32 sketches. Drop it into a project 
 - Submitting the form retries connection. On success, saves credentials to LittleFS and switches the device into Station mode.
 - Exposes the underlying `WebServer` so consumers can register their own routes (status pages, REST endpoints, etc).
 
+## Requirements
+
+This library targets **Arduino-ESP32 3.x** (ESP-IDF v5.1+) so it can use `ESP_NETIF_CAPTIVEPORTAL_URI` (RFC 7710 / DHCP option 114) for reliable captive-portal detection on iOS, Android, and macOS. The official `platformio/platform-espressif32` still ships Arduino-ESP32 2.0.17, so use the [`pioarduino/platform-espressif32`](https://github.com/pioarduino/platform-espressif32) community fork until that catches up.
+
 ## Install
 
 ### PlatformIO
@@ -17,11 +21,14 @@ A reusable WiFi configuration portal for ESP32 sketches. Drop it into a project 
 In your project's `platformio.ini`:
 
 ```ini
+[env:esp32dev]
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.38-1/platform-espressif32.zip
+board = esp32doit-devkit-v1
+framework = arduino
+board_build.filesystem = littlefs
 lib_deps =
     https://github.com/apaier/ESP32WiFiPortal.git
     bblanchon/ArduinoJson@^7.0.0
-
-board_build.filesystem = littlefs
 ```
 
 During local development before publishing, point at a checkout instead:

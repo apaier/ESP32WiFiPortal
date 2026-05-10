@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <esp_netif.h>
 
 namespace {
 constexpr uint32_t kConnectAttemptSeconds = 30;
@@ -139,6 +140,26 @@ void ESP32WiFiPortal::startAccessPoint() {
 
     _dns.setErrorReplyCode(DNSReplyCode::NoError);
     _dns.start(53, "*", WiFi.softAPIP());
+
+    // RFC 7710 / DHCP option 114: tell modern clients (iOS 14+, Android 11+,
+    // macOS 11+) directly via DHCP that this is a captive portal and where
+    // it lives, bypassing the per-SSID "this network has internet" cache
+    // that otherwise suppresses the captive UI on rejoin.
+    esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (apNetif != nullptr) {
+        char uri[64];
+        snprintf(uri, sizeof(uri), "http://%s/", WiFi.softAPIP().toString().c_str());
+        esp_netif_dhcps_stop(apNetif);
+        esp_err_t err = esp_netif_dhcps_option(
+            apNetif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+            uri, strlen(uri));
+        esp_netif_dhcps_start(apNetif);
+        if (err == ESP_OK) {
+            Serial.printf("[ESP32WiFiPortal] DHCP option 114 set: %s\n", uri);
+        } else {
+            Serial.printf("[ESP32WiFiPortal] DHCP option 114 failed: 0x%x\n", err);
+        }
+    }
 }
 
 void ESP32WiFiPortal::persistCredentials(const String& network, const String& password) {
