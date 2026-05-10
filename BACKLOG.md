@@ -26,8 +26,8 @@ WiFi credentials currently sit in plaintext at `/wifi.json` on LittleFS. Move at
 
 ## Library / packaging
 
-### 8. WiFiRepeater example
-Port [ESP32-Wifi-Repeater](https://github.com/apaier/ESP32-Wifi-Repeater) (`WiFiExtender.ino`) to use this library as its config-portal layer, with the sketch supplying the AP+STA + NAPT bits the library doesn't own. Likely depends on a "library doesn't manage WiFi.mode()" hook or option.
+### 8. WiFiRepeater example — done (0.2.0)
+Implemented in-library rather than as a separate example: the config form has a Client / Repeater radio button, and selecting Repeater brings up an AP on a non-overlapping `/24` (SSID `<upstream>-extender`, same password as upstream) with NAPT forwarding via `WiFi.AP.enableNAPT`. STA disconnect/reconnect toggles NAPT through a `Network.onEvent` handler.
 
 ### 9. Arduino Library Manager submission
 Once the API has settled, submit to the Arduino IDE Library Manager index so users can install via the IDE's library browser.

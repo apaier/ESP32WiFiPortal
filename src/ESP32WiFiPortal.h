@@ -28,7 +28,7 @@
 #include <IPAddress.h>
 #include <WebServer.h>
 
-enum class WiFiPortalMode { AccessPoint, Connected };
+enum class WiFiPortalMode { AccessPoint, Connected, Repeating };
 
 class ESP32WiFiPortal {
 public:
@@ -69,12 +69,19 @@ private:
     String _apPassword;
     String _htmlPath;
     String _configPath;
+    String _repeaterApSsid;
+    IPAddress _repeaterApIp;
 
     bool ensureFilesystem();
     bool loadAndConnect();
     void startAccessPoint();
-    bool tryConnect(const String& network, const String& password);
-    void persistCredentials(const String& network, const String& password);
+    void startRepeaterAccessPoint(const String& upstreamSsid,
+                                  const String& upstreamPassword);
+    IPAddress pickRepeaterSubnet() const;
+    bool tryConnect(const String& network, const String& password,
+                    const String& mode);
+    void persistCredentials(const String& network, const String& password,
+                            const String& mode);
     void handleConfigPage();
     void handleCaptiveRedirect();
     void registerPages();

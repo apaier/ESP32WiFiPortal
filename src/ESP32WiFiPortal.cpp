@@ -9,6 +9,15 @@ namespace {
 constexpr uint32_t kConnectAttemptSeconds = 30;
 constexpr const char* kJsonNetworkKey = "network";
 constexpr const char* kJsonPasswordKey = "password";
+constexpr const char* kJsonModeKey = "mode";
+constexpr const char* kModeClient = "client";
+constexpr const char* kModeRepeater = "repeater";
+constexpr const char* kRepeaterApSuffix = "-extender";
+
+uint32_t ipToU32(const IPAddress& ip) {
+    return ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) |
+           ((uint32_t)ip[2] << 8) | (uint32_t)ip[3];
+}
 }  // namespace
 
 ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
@@ -49,7 +58,10 @@ WiFiPortalMode ESP32WiFiPortal::getMode() const { return _mode; }
 bool ESP32WiFiPortal::isConnected() const { return WiFi.status() == WL_CONNECTED; }
 
 IPAddress ESP32WiFiPortal::getIP() const {
-    return _mode == WiFiPortalMode::Connected ? WiFi.localIP() : WiFi.softAPIP();
+    if (_mode == WiFiPortalMode::Connected || _mode == WiFiPortalMode::Repeating) {
+        return WiFi.localIP();
+    }
+    return WiFi.softAPIP();
 }
 
 WebServer& ESP32WiFiPortal::server() { return _server; }
@@ -96,10 +108,13 @@ bool ESP32WiFiPortal::loadAndConnect() {
 
     String network = doc[kJsonNetworkKey].as<String>();
     String password = doc[kJsonPasswordKey].as<String>();
-    return tryConnect(network, password);
+    String mode = doc[kJsonModeKey].as<String>();
+    if (mode != kModeRepeater) mode = kModeClient;
+    return tryConnect(network, password, mode);
 }
 
-bool ESP32WiFiPortal::tryConnect(const String& network, const String& password) {
+bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
+                                 const String& mode) {
     WiFi.mode(WIFI_STA);
     WiFi.begin(network.c_str(), password.c_str());
     Serial.print("[ESP32WiFiPortal] Connecting to ");
@@ -122,7 +137,11 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password) 
     if (_ledPin >= 0) digitalWrite(_ledPin, HIGH);
     Serial.print("[ESP32WiFiPortal] Connected, IP ");
     Serial.println(WiFi.localIP());
-    persistCredentials(network, password);
+    persistCredentials(network, password, mode);
+
+    if (mode == kModeRepeater) {
+        startRepeaterAccessPoint(network, password);
+    }
     return true;
 }
 
@@ -162,7 +181,83 @@ void ESP32WiFiPortal::startAccessPoint() {
     }
 }
 
-void ESP32WiFiPortal::persistCredentials(const String& network, const String& password) {
+IPAddress ESP32WiFiPortal::pickRepeaterSubnet() const {
+    // Choose a /24 for the repeater AP that doesn't overlap the upstream
+    // subnet. NAPT requires the two interfaces be on different networks.
+    uint32_t staIp = ipToU32(WiFi.localIP());
+    uint32_t staMask = ipToU32(WiFi.subnetMask());
+    uint32_t staNet = staIp & staMask;
+    uint32_t staBcast = staNet | ~staMask;
+
+    struct Candidate { uint8_t a, b, c; };
+    const Candidate candidates[] = {
+        {192, 168, 244},
+        {10, 244, 0},
+        {172, 31, 244},
+    };
+
+    for (const auto& cand : candidates) {
+        uint32_t candNet = ((uint32_t)cand.a << 24) |
+                           ((uint32_t)cand.b << 16) |
+                           ((uint32_t)cand.c << 8);
+        uint32_t candBcast = candNet | 0xFFu;
+        bool overlap = !(candBcast < staNet || staBcast < candNet);
+        if (!overlap) {
+            return IPAddress(cand.a, cand.b, cand.c, 1);
+        }
+    }
+    return IPAddress(192, 168, 244, 1);
+}
+
+void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
+                                               const String& upstreamPassword) {
+    _repeaterApIp = pickRepeaterSubnet();
+    _repeaterApSsid = upstreamSsid + kRepeaterApSuffix;
+    IPAddress mask(255, 255, 255, 0);
+
+    WiFi.mode(WIFI_AP_STA);
+    if (!WiFi.softAPConfig(_repeaterApIp, _repeaterApIp, mask)) {
+        Serial.println("[ESP32WiFiPortal] softAPConfig failed; aborting repeater");
+        return;
+    }
+    bool apUp = upstreamPassword.length() > 0
+                    ? WiFi.softAP(_repeaterApSsid.c_str(), upstreamPassword.c_str())
+                    : WiFi.softAP(_repeaterApSsid.c_str());
+    if (!apUp) {
+        Serial.println("[ESP32WiFiPortal] softAP failed; aborting repeater");
+        return;
+    }
+
+    Serial.printf("[ESP32WiFiPortal] Repeater AP \"%s\" on %s\n",
+                  _repeaterApSsid.c_str(),
+                  _repeaterApIp.toString().c_str());
+
+    // Toggle NAPT on STA up/down so a brief upstream outage doesn't strand
+    // the AP with stale forwarding state.
+    Network.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+        (void)info;
+        switch (event) {
+            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+                WiFi.AP.enableNAPT(true);
+                Serial.println("[ESP32WiFiPortal] NAPT enabled");
+                break;
+            case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+                WiFi.AP.enableNAPT(false);
+                Serial.println("[ESP32WiFiPortal] NAPT disabled");
+                break;
+            default:
+                break;
+        }
+    });
+    WiFi.AP.enableNAPT(true);
+
+    _mode = WiFiPortalMode::Repeating;
+}
+
+void ESP32WiFiPortal::persistCredentials(const String& network,
+                                         const String& password,
+                                         const String& mode) {
     if (!_fsReady) return;
     LittleFS.remove(_configPath);
     File file = LittleFS.open(_configPath, FILE_WRITE);
@@ -173,6 +268,7 @@ void ESP32WiFiPortal::persistCredentials(const String& network, const String& pa
     JsonDocument doc;
     doc[kJsonNetworkKey] = network;
     doc[kJsonPasswordKey] = password;
+    doc[kJsonModeKey] = (mode == kModeRepeater) ? kModeRepeater : kModeClient;
     String payload;
     serializeJson(doc, payload);
     if (!file.print(payload)) {
@@ -182,8 +278,11 @@ void ESP32WiFiPortal::persistCredentials(const String& network, const String& pa
 }
 
 void ESP32WiFiPortal::handleConfigPage() {
-    if (_server.args() > 0) {
-        tryConnect(_server.arg(kJsonNetworkKey), _server.arg(kJsonPasswordKey));
+    if (_server.hasArg(kJsonNetworkKey)) {
+        String submittedMode = _server.arg(kJsonModeKey);
+        if (submittedMode != kModeRepeater) submittedMode = kModeClient;
+        tryConnect(_server.arg(kJsonNetworkKey), _server.arg(kJsonPasswordKey),
+                   submittedMode);
     }
 
     int networks = WiFi.scanNetworks();
@@ -208,14 +307,20 @@ void ESP32WiFiPortal::handleConfigPage() {
     file.close();
 
     String status;
-    if (WiFi.status() == WL_CONNECTED) {
+    if (_mode == WiFiPortalMode::Repeating) {
+        status = "Repeating " + WiFi.SSID() + " as \"" + _repeaterApSsid +
+                 "\" (RSSI " + WiFi.RSSI() + ")";
+    } else if (WiFi.status() == WL_CONNECTED) {
         status = "Connected to " + WiFi.SSID() + " (RSSI " + WiFi.RSSI() + ")";
     } else {
         status = "Access Point Mode - IP " + WiFi.softAPIP().toString();
     }
 
+    bool isRepeater = (_mode == WiFiPortalMode::Repeating);
     html.replace("***options***", options);
     html.replace("***Connection Status***", status);
+    html.replace("***client_checked***", isRepeater ? "" : "checked");
+    html.replace("***repeater_checked***", isRepeater ? "checked" : "");
     _server.send(200, "text/html", html);
 }
 

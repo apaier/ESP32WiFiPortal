@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 - Unreleased
+
+- Repeater mode. The config form now has a Client / Repeater radio. When Repeater is selected and the upstream join succeeds, the device brings up an AP on a non-overlapping `/24` (default candidates `192.168.244.0/24`, `10.244.0.0/24`, `172.31.244.0/24`), SSID `<upstream>-extender`, same password as upstream, with NAPT forwarding enabled via `WiFi.AP.enableNAPT`. Falls back to AP config mode unchanged if the upstream join fails.
+- A `Network.onEvent` handler toggles NAPT on `STA_GOT_IP` / `STA_DISCONNECTED` / `STA_LOST_IP` so a brief upstream outage doesn't strand the AP with stale forwarding state.
+- Added `WiFiPortalMode::Repeating` state. `getIP()` returns the STA IP in this state; the captive-portal DNSServer, redirect, and DHCP option 114 do not run.
+- HTML config page gained two new substitution tokens: `***client_checked***` and `***repeater_checked***`. `/wifi.json` gained a `mode` field (`"client"` or `"repeater"`); missing values default to `"client"` so existing installs upgrade cleanly.
+
 ## 0.1.0 - Unreleased
 
 Initial release.

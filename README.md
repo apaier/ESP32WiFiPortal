@@ -7,8 +7,18 @@ A reusable WiFi configuration portal for ESP32 sketches. Drop it into a project 
 - On boot, mounts LittleFS and reads `/wifi.json` for saved credentials.
 - If credentials exist, attempts to join the network (30s timeout).
 - If no credentials exist, or the join fails, starts an open Access Point and serves a configuration page on `/` and `/wifi`.
-- Submitting the form retries connection. On success, saves credentials to LittleFS and switches the device into Station mode.
+- Submitting the form retries connection. On success, saves credentials to LittleFS and switches the device into Station mode — or into Repeater mode, if that was selected on the form (see below).
 - Exposes the underlying `WebServer` so consumers can register their own routes (status pages, REST endpoints, etc).
+
+### Repeater mode
+
+The config form has a Client / Repeater radio button. When Repeater is chosen and the upstream join succeeds, the device also brings up its own AP and NAT-forwards traffic from clients of that AP to the upstream network.
+
+- AP SSID defaults to `<upstream-SSID>-extender`.
+- AP password is the same as the upstream password (or open, if upstream is open).
+- AP subnet is picked at boot to avoid overlap with the upstream (candidates: `192.168.244.0/24`, `10.244.0.0/24`, `172.31.244.0/24`).
+- The captive-portal DNS / redirect / DHCP option 114 only run in the standalone config-AP fallback, never in Repeater mode.
+- Reach the config page from any client of the repeater AP, or from the upstream LAN at the device's STA IP, to change mode or upstream network.
 
 ## Requirements
 
@@ -91,7 +101,7 @@ void begin(const String& accessPointName,
            const String& accessPointPassword = String());
 void loop();
 
-WiFiPortalMode getMode() const;       // AccessPoint | Connected
+WiFiPortalMode getMode() const;       // AccessPoint | Connected | Repeating
 bool           isConnected() const;
 IPAddress      getIP() const;
 
@@ -105,17 +115,17 @@ void setConfigPath(const String& path);// default "/wifi.json"
 
 ## Customising the HTML
 
-The library reads `/WiFiSetup.html` from LittleFS at request time and substitutes two placeholders:
+The library reads `/WiFiSetup.html` from LittleFS at request time and substitutes four placeholders:
 
 - `***options***` — `<option>` tags for each scanned network.
 - `***Connection Status***` — current connection state.
+- `***client_checked***` / `***repeater_checked***` — `checked` injected into whichever mode radio is currently saved.
 
-You can replace the file with any markup you want as long as those two placeholders and a form posting `network` + `password` to `/wifi` are present.
+You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present.
 
 ## Examples
 
-- **BasicConfigPortal** — minimal sketch showing the default behaviour.
-- **WiFiRepeater** — *(planned)* full AP+STA repeater with NAT, ported from the [ESP32-Wifi-Repeater](https://github.com/apaier/ESP32-Wifi-Repeater) project. Pending the AP+STA support listed in [BACKLOG.md](BACKLOG.md).
+- **BasicConfigPortal** — minimal sketch showing the default behaviour, including Client/Repeater mode selection on the config form.
 
 ## Roadmap
 
