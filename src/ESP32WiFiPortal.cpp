@@ -37,6 +37,9 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 }
 
 void ESP32WiFiPortal::loop() {
+    if (_mode == WiFiPortalMode::AccessPoint) {
+        _dns.processNextRequest();
+    }
     _server.handleClient();
 }
 
@@ -133,6 +136,9 @@ void ESP32WiFiPortal::startAccessPoint() {
     }
     Serial.print("[ESP32WiFiPortal] AP IP ");
     Serial.println(WiFi.softAPIP());
+
+    _dns.setErrorReplyCode(DNSReplyCode::NoError);
+    _dns.start(53, "*", WiFi.softAPIP());
 }
 
 void ESP32WiFiPortal::persistCredentials(const String& network, const String& password) {
@@ -192,10 +198,23 @@ void ESP32WiFiPortal::handleConfigPage() {
     _server.send(200, "text/html", html);
 }
 
+void ESP32WiFiPortal::handleCaptiveRedirect() {
+    if (_mode == WiFiPortalMode::AccessPoint) {
+        String apIp = WiFi.softAPIP().toString();
+        if (_server.hostHeader() != apIp) {
+            _server.sendHeader("Location", String("http://") + apIp + "/", true);
+            _server.send(302, "text/plain", "");
+            return;
+        }
+    }
+    _server.send(404, "text/plain", "Not Found");
+}
+
 void ESP32WiFiPortal::registerPages() {
     if (_pagesRegistered) return;
     auto handler = [this]() { this->handleConfigPage(); };
     _server.on("/", handler);
     _server.on("/wifi", handler);
+    _server.onNotFound([this]() { this->handleCaptiveRedirect(); });
     _pagesRegistered = true;
 }

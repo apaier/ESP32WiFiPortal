@@ -13,11 +13,10 @@ A numeric field on the config page that sets a reconnect interval, persisted to 
 ### 3. Periodic reconnect from AP mode when STA credentials exist
 When the device falls back to AP mode but `/wifi.json` exists, retry the saved network on the configured interval (#2). On success, switch to Station mode.
 
+When this lands, also stop the captive-portal `DNSServer` on the AP→STA transition (and re-start it on any STA→AP fallback). Today it's started once in `startAccessPoint()` and never stopped, which is correct only because the mode is fixed at boot.
+
 ### 4. Configurable AP credentials via UI
 Today the AP is open and its name is whatever the sketch passes to `begin()`. Add fields for AP name + password and persist them.
-
-### 5. Captive-portal redirect
-DNS server + catch-all handler so connecting to the AP auto-opens the config page on most phones / laptops.
 
 ### 6. mDNS / configurable hostname
 Optional `setHostname()` and mDNS announcement so the device is reachable as `mydevice.local` on the network.

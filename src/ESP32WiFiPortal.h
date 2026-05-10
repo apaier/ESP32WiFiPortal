@@ -24,6 +24,7 @@
 #define ESP32_WIFI_PORTAL_H
 
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <IPAddress.h>
 #include <WebServer.h>
 
@@ -59,6 +60,7 @@ public:
 
 private:
     WebServer _server;
+    DNSServer _dns;
     int _ledPin;
     WiFiPortalMode _mode;
     bool _fsReady;
@@ -74,6 +76,7 @@ private:
     bool tryConnect(const String& network, const String& password);
     void persistCredentials(const String& network, const String& password);
     void handleConfigPage();
+    void handleCaptiveRedirect();
     void registerPages();
 };
 
