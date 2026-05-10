@@ -214,9 +214,16 @@ void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
     _repeaterApIp = pickRepeaterSubnet();
     _repeaterApSsid = upstreamSsid + kRepeaterApSuffix;
     IPAddress mask(255, 255, 255, 0);
+    IPAddress leaseStart(_repeaterApIp[0], _repeaterApIp[1], _repeaterApIp[2], 2);
+    // Hand clients whatever DNS upstream gave us. Without this the DHCP
+    // server advertises the AP IP itself, which black-holes lookups because
+    // we don't run a resolver. Fall back to 8.8.4.4 if upstream didn't
+    // supply one (unlikely on a working STA association).
+    IPAddress dns = WiFi.dnsIP(0);
+    if ((uint32_t)dns == 0) dns = IPAddress(8, 8, 4, 4);
 
     WiFi.mode(WIFI_AP_STA);
-    if (!WiFi.softAPConfig(_repeaterApIp, _repeaterApIp, mask)) {
+    if (!WiFi.softAPConfig(_repeaterApIp, _repeaterApIp, mask, leaseStart, dns)) {
         Serial.println("[ESP32WiFiPortal] softAPConfig failed; aborting repeater");
         return;
     }
