@@ -71,9 +71,16 @@ private:
     String _configPath;
     String _repeaterApSsid;
     IPAddress _repeaterApIp;
+    uint32_t _reconnectIntervalMs;
+    uint32_t _lastAttemptMs;
+    bool _retryArmed;
+    uint32_t _disconnectedSinceMs;
+    bool _disconnected;
 
     bool ensureFilesystem();
     bool loadAndConnect();
+    void scheduleReconnect();
+    void attemptReconnect();
     void startAccessPoint();
     void startRepeaterAccessPoint(const String& upstreamSsid,
                                   const String& upstreamPassword);

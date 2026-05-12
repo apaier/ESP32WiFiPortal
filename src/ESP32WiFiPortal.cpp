@@ -7,6 +7,8 @@
 
 namespace {
 constexpr uint32_t kConnectAttemptSeconds = 30;
+constexpr uint32_t kDefaultReconnectIntervalMs = 3UL * 60UL * 1000UL;
+constexpr uint32_t kMaxDisconnectGraceMs = 60UL * 1000UL;
 constexpr const char* kJsonNetworkKey = "network";
 constexpr const char* kJsonPasswordKey = "password";
 constexpr const char* kJsonModeKey = "mode";
@@ -27,7 +29,12 @@ ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
       _fsReady(false),
       _pagesRegistered(false),
       _htmlPath("/WiFiSetup.html"),
-      _configPath("/wifi.json") {}
+      _configPath("/wifi.json"),
+      _reconnectIntervalMs(kDefaultReconnectIntervalMs),
+      _lastAttemptMs(0),
+      _retryArmed(false),
+      _disconnectedSinceMs(0),
+      _disconnected(false) {}
 
 void ESP32WiFiPortal::begin(const String& accessPointName,
                             const String& accessPointPassword) {
@@ -40,6 +47,7 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 
     if (!loadAndConnect()) {
         startAccessPoint();
+        scheduleReconnect();
     }
 
     registerPages();
@@ -49,6 +57,29 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 void ESP32WiFiPortal::loop() {
     if (_mode == WiFiPortalMode::AccessPoint) {
         _dns.processNextRequest();
+        if (_retryArmed &&
+            (millis() - _lastAttemptMs) >= _reconnectIntervalMs) {
+            _retryArmed = false;
+            attemptReconnect();
+        }
+    } else if (_reconnectIntervalMs != 0) {
+        // The chip's auto-reassociation usually recovers within seconds,
+        // so we wait a grace period before tearing down to AP mode.
+        if (WiFi.status() == WL_CONNECTED) {
+            _disconnected = false;
+        } else if (!_disconnected) {
+            _disconnected = true;
+            _disconnectedSinceMs = millis();
+            Serial.println("[ESP32WiFiPortal] STA disconnected; waiting for grace");
+        } else {
+            uint32_t grace = _reconnectIntervalMs / 2;
+            if (grace > kMaxDisconnectGraceMs) grace = kMaxDisconnectGraceMs;
+            if ((millis() - _disconnectedSinceMs) >= grace) {
+                Serial.println("[ESP32WiFiPortal] STA grace expired; falling back to AP mode");
+                startAccessPoint();
+                scheduleReconnect();
+            }
+        }
     }
     _server.handleClient();
 }
@@ -113,6 +144,23 @@ bool ESP32WiFiPortal::loadAndConnect() {
     return tryConnect(network, password, mode);
 }
 
+void ESP32WiFiPortal::scheduleReconnect() {
+    if (_reconnectIntervalMs == 0) return;
+    if (!_fsReady || !LittleFS.exists(_configPath)) return;
+    _lastAttemptMs = millis();
+    _retryArmed = true;
+    Serial.printf("[ESP32WiFiPortal] Reconnect scheduled in %lu ms\n",
+                  (unsigned long)_reconnectIntervalMs);
+}
+
+void ESP32WiFiPortal::attemptReconnect() {
+    if (!LittleFS.exists(_configPath)) return;
+    Serial.println("[ESP32WiFiPortal] Retry: attempting saved network");
+    if (loadAndConnect()) return;
+    startAccessPoint();
+    scheduleReconnect();
+}
+
 bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
                                  const String& mode) {
     WiFi.mode(WIFI_STA);
@@ -133,6 +181,9 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
         return false;
     }
 
+    _dns.stop();
+    _disconnected = false;
+    _disconnectedSinceMs = 0;
     _mode = WiFiPortalMode::Connected;
     if (_ledPin >= 0) digitalWrite(_ledPin, HIGH);
     Serial.print("[ESP32WiFiPortal] Connected, IP ");
@@ -147,8 +198,20 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
 
 void ESP32WiFiPortal::startAccessPoint() {
     _mode = WiFiPortalMode::AccessPoint;
+    _disconnected = false;
+    _disconnectedSinceMs = 0;
     Serial.println("[ESP32WiFiPortal] Starting Access Point");
+
+    // Tear down any prior softAP so leftover config from repeater mode
+    // (non-default IP, upstream DNS in DHCP) doesn't carry through.
+    WiFi.softAPdisconnect(false);
     WiFi.mode(WIFI_AP);
+
+    IPAddress apIp(192, 168, 4, 1);
+    IPAddress mask(255, 255, 255, 0);
+    IPAddress leaseStart(192, 168, 4, 2);
+    WiFi.softAPConfig(apIp, apIp, mask, leaseStart, apIp);
+
     if (_apPassword.length() > 0) {
         WiFi.softAP(_apName.c_str(), _apPassword.c_str());
     } else {
@@ -157,6 +220,7 @@ void ESP32WiFiPortal::startAccessPoint() {
     Serial.print("[ESP32WiFiPortal] AP IP ");
     Serial.println(WiFi.softAPIP());
 
+    _dns.stop();
     _dns.setErrorReplyCode(DNSReplyCode::NoError);
     _dns.start(53, "*", WiFi.softAPIP());
 
