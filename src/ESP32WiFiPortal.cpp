@@ -7,8 +7,10 @@
 
 namespace {
 constexpr uint32_t kConnectAttemptSeconds = 30;
-constexpr uint32_t kDefaultReconnectIntervalMs = 3UL * 60UL * 1000UL;
-constexpr uint32_t kMaxDisconnectGraceMs = 60UL * 1000UL;
+constexpr uint32_t kScanCadenceMs = 30UL * 1000UL;
+constexpr uint32_t kScanTimeoutMs = 15UL * 1000UL;
+constexpr uint32_t kBlindRetryFloorMs = 15UL * 60UL * 1000UL;
+constexpr uint8_t kSoftFailEventsBeforeFallback = 10;
 constexpr const char* kJsonNetworkKey = "network";
 constexpr const char* kJsonPasswordKey = "password";
 constexpr const char* kJsonModeKey = "mode";
@@ -30,11 +32,15 @@ ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
       _pagesRegistered(false),
       _htmlPath("/WiFiSetup.html"),
       _configPath("/wifi.json"),
-      _reconnectIntervalMs(kDefaultReconnectIntervalMs),
-      _lastAttemptMs(0),
-      _retryArmed(false),
-      _disconnectedSinceMs(0),
-      _disconnected(false) {}
+      _scanInFlight(false),
+      _scanStartedMs(0),
+      _lastScanMs(0),
+      _softFailEventCount(0),
+      _hardFail(false),
+      _lastBlindRetryMs(0),
+      _eventsRegistered(false),
+      _disconnectEventPending(false),
+      _disconnectReason(0) {}
 
 void ESP32WiFiPortal::begin(const String& accessPointName,
                             const String& accessPointPassword) {
@@ -45,9 +51,10 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
         return;
     }
 
+    registerWiFiEvents();
+
     if (!loadAndConnect()) {
         startAccessPoint();
-        scheduleReconnect();
     }
 
     registerPages();
@@ -57,30 +64,30 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 void ESP32WiFiPortal::loop() {
     if (_mode == WiFiPortalMode::AccessPoint) {
         _dns.processNextRequest();
-        if (_retryArmed &&
-            (millis() - _lastAttemptMs) >= _reconnectIntervalMs) {
-            _retryArmed = false;
+    }
+
+    if (_scanInFlight) {
+        pollScanCompletion();
+    }
+
+    if (_disconnectEventPending) {
+        _disconnectEventPending = false;
+        handleDisconnectEvent();
+    }
+
+    bool inApMode = (_mode == WiFiPortalMode::AccessPoint);
+    bool haveCreds = _fsReady && LittleFS.exists(_configPath);
+    if (inApMode && haveCreds && !_hardFail && !_scanInFlight) {
+        if ((millis() - _lastScanMs) >= kScanCadenceMs) {
+            startScan();
+        } else if ((millis() - _lastBlindRetryMs) >= kBlindRetryFloorMs) {
+            // Hidden SSIDs and DFS-channel APs may never appear in passive
+            // scans, so a slow blind retry covers those.
+            _lastBlindRetryMs = millis();
             attemptReconnect();
         }
-    } else if (_reconnectIntervalMs != 0) {
-        // The chip's auto-reassociation usually recovers within seconds,
-        // so we wait a grace period before tearing down to AP mode.
-        if (WiFi.status() == WL_CONNECTED) {
-            _disconnected = false;
-        } else if (!_disconnected) {
-            _disconnected = true;
-            _disconnectedSinceMs = millis();
-            Serial.println("[ESP32WiFiPortal] STA disconnected; waiting for grace");
-        } else {
-            uint32_t grace = _reconnectIntervalMs / 2;
-            if (grace > kMaxDisconnectGraceMs) grace = kMaxDisconnectGraceMs;
-            if ((millis() - _disconnectedSinceMs) >= grace) {
-                Serial.println("[ESP32WiFiPortal] STA grace expired; falling back to AP mode");
-                startAccessPoint();
-                scheduleReconnect();
-            }
-        }
     }
+
     _server.handleClient();
 }
 
@@ -144,25 +151,158 @@ bool ESP32WiFiPortal::loadAndConnect() {
     return tryConnect(network, password, mode);
 }
 
-void ESP32WiFiPortal::scheduleReconnect() {
-    if (_reconnectIntervalMs == 0) return;
-    if (!_fsReady || !LittleFS.exists(_configPath)) return;
-    _lastAttemptMs = millis();
-    _retryArmed = true;
-    Serial.printf("[ESP32WiFiPortal] Reconnect scheduled in %lu ms\n",
-                  (unsigned long)_reconnectIntervalMs);
+void ESP32WiFiPortal::registerWiFiEvents() {
+    if (_eventsRegistered) return;
+    Network.onEvent([this](arduino_event_id_t event, arduino_event_info_t info) {
+        switch (event) {
+            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+                _disconnectReason = info.wifi_sta_disconnected.reason;
+                _disconnectEventPending = true;
+                if (_mode == WiFiPortalMode::Repeating) {
+                    WiFi.AP.enableNAPT(false);
+                }
+                break;
+            case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+                if (_mode == WiFiPortalMode::Repeating) {
+                    WiFi.AP.enableNAPT(false);
+                }
+                break;
+            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+                _softFailEventCount = 0;
+                if (_mode == WiFiPortalMode::Repeating) {
+                    WiFi.AP.enableNAPT(true);
+                }
+                break;
+            default:
+                break;
+        }
+    });
+    _eventsRegistered = true;
+}
+
+bool ESP32WiFiPortal::isHardFailReason(uint8_t reason) const {
+    switch (reason) {
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_ASSOC_FAIL:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ESP32WiFiPortal::handleDisconnectEvent() {
+    if (_mode != WiFiPortalMode::Connected &&
+        _mode != WiFiPortalMode::Repeating) {
+        return;
+    }
+    uint8_t reason = _disconnectReason;
+    if (isHardFailReason(reason)) {
+        Serial.printf("[ESP32WiFiPortal] Hard-fail disconnect (reason %u); to AP\n",
+                      reason);
+        _hardFail = true;
+        // Stop the chip from auto-reassociating with bad credentials.
+        WiFi.disconnect(false, true);
+        startAccessPoint();
+        return;
+    }
+    // Soft fail: the chip's auto-reconnect is now busy retrying. We can't
+    // usefully scan while it's in that state (esp_wifi_scan_start is
+    // rejected), so we just count consecutive failed attempts. A successful
+    // STA_GOT_IP resets the counter from the event handler.
+    _softFailEventCount++;
+    Serial.printf("[ESP32WiFiPortal] Soft-fail disconnect (reason %u, %u/%u)\n",
+                  reason, _softFailEventCount,
+                  kSoftFailEventsBeforeFallback);
+    if (_softFailEventCount >= kSoftFailEventsBeforeFallback) {
+        Serial.println("[ESP32WiFiPortal] Soft-fail count exceeded; to AP");
+        startAccessPoint();
+    }
+}
+
+String ESP32WiFiPortal::loadSavedSsid() {
+    if (!_fsReady || !LittleFS.exists(_configPath)) return String();
+    File file = LittleFS.open(_configPath, FILE_READ);
+    if (!file) return String();
+    String content = file.readString();
+    file.close();
+    JsonDocument doc;
+    if (deserializeJson(doc, content)) return String();
+    return doc[kJsonNetworkKey].as<String>();
+}
+
+void ESP32WiFiPortal::startScan() {
+    if (_scanInFlight) return;
+    int16_t result = WiFi.scanNetworks(true /* async */);
+    if (result == WIFI_SCAN_FAILED) {
+        Serial.println("[ESP32WiFiPortal] scanNetworks failed to start");
+        _lastScanMs = millis();
+        return;
+    }
+    _scanInFlight = true;
+    _scanStartedMs = millis();
+}
+
+void ESP32WiFiPortal::pollScanCompletion() {
+    int16_t result = WiFi.scanComplete();
+    if (result == WIFI_SCAN_RUNNING) {
+        if ((millis() - _scanStartedMs) >= kScanTimeoutMs) {
+            Serial.println("[ESP32WiFiPortal] Scan stuck; aborting");
+            WiFi.scanDelete();
+            _scanInFlight = false;
+            _lastScanMs = millis();
+        }
+        return;
+    }
+    if (result < 0) {
+        WiFi.scanDelete();
+        _scanInFlight = false;
+        _lastScanMs = millis();
+        return;
+    }
+    handleScanResult(result);
+    WiFi.scanDelete();
+    _scanInFlight = false;
+    _lastScanMs = millis();
+}
+
+void ESP32WiFiPortal::handleScanResult(int count) {
+    if (_mode != WiFiPortalMode::AccessPoint) return;
+    String saved = loadSavedSsid();
+    if (saved.length() == 0) return;
+
+    bool found = false;
+    int32_t bestRssi = -127;
+    for (int i = 0; i < count; ++i) {
+        if (WiFi.SSID(i) == saved) {
+            found = true;
+            if (WiFi.RSSI(i) > bestRssi) bestRssi = WiFi.RSSI(i);
+        }
+    }
+    if (found) {
+        Serial.printf("[ESP32WiFiPortal] Saved SSID '%s' visible (RSSI %d); reconnecting\n",
+                      saved.c_str(), (int)bestRssi);
+        attemptReconnect();
+    }
 }
 
 void ESP32WiFiPortal::attemptReconnect() {
     if (!LittleFS.exists(_configPath)) return;
-    Serial.println("[ESP32WiFiPortal] Retry: attempting saved network");
-    if (loadAndConnect()) return;
-    startAccessPoint();
-    scheduleReconnect();
+    Serial.println("[ESP32WiFiPortal] Attempting saved network");
+    if (!loadAndConnect()) {
+        startAccessPoint();
+    }
 }
 
 bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
                                  const String& mode) {
+    _hardFail = false;
+    _softFailEventCount = 0;
+    // Re-arm chip-level auto-reconnect so transient drops after a
+    // successful association recover on their own (we may have left it
+    // off after a prior AP fallback).
+    WiFi.setAutoReconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.begin(network.c_str(), password.c_str());
     Serial.print("[ESP32WiFiPortal] Connecting to ");
@@ -182,8 +322,6 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     }
 
     _dns.stop();
-    _disconnected = false;
-    _disconnectedSinceMs = 0;
     _mode = WiFiPortalMode::Connected;
     if (_ledPin >= 0) digitalWrite(_ledPin, HIGH);
     Serial.print("[ESP32WiFiPortal] Connected, IP ");
@@ -198,14 +336,25 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
 
 void ESP32WiFiPortal::startAccessPoint() {
     _mode = WiFiPortalMode::AccessPoint;
-    _disconnected = false;
-    _disconnectedSinceMs = 0;
+    _scanInFlight = false;
+    _softFailEventCount = 0;
+    // Defer the first scan/retry by their full cadence so the AP has time
+    // to settle before we steal radio time again.
+    _lastScanMs = millis();
+    _lastBlindRetryMs = millis();
     Serial.println("[ESP32WiFiPortal] Starting Access Point");
 
+    // Halt the chip's auto-reassociation. Otherwise esp_wifi_scan_start()
+    // is rejected while the chip is mid-connect-attempt, and our periodic
+    // scan-and-pounce never gets a chance to run.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, false);
     // Tear down any prior softAP so leftover config from repeater mode
     // (non-default IP, upstream DNS in DHCP) doesn't carry through.
     WiFi.softAPdisconnect(false);
-    WiFi.mode(WIFI_AP);
+    // AP_STA keeps the STA radio available for periodic scans so the AP
+    // doesn't have to be torn down to look for the saved network.
+    WiFi.mode(WIFI_AP_STA);
 
     IPAddress apIp(192, 168, 4, 1);
     IPAddress mask(255, 255, 255, 0);
@@ -303,24 +452,8 @@ void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
                   _repeaterApSsid.c_str(),
                   _repeaterApIp.toString().c_str());
 
-    // Toggle NAPT on STA up/down so a brief upstream outage doesn't strand
-    // the AP with stale forwarding state.
-    Network.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
-        (void)info;
-        switch (event) {
-            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-                WiFi.AP.enableNAPT(true);
-                Serial.println("[ESP32WiFiPortal] NAPT enabled");
-                break;
-            case ARDUINO_EVENT_WIFI_STA_LOST_IP:
-            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-                WiFi.AP.enableNAPT(false);
-                Serial.println("[ESP32WiFiPortal] NAPT disabled");
-                break;
-            default:
-                break;
-        }
-    });
+    // NAPT toggling on STA up/down is handled by the global event handler
+    // installed in registerWiFiEvents().
     WiFi.AP.enableNAPT(true);
 
     _mode = WiFiPortalMode::Repeating;

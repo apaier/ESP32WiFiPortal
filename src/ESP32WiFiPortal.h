@@ -71,15 +71,28 @@ private:
     String _configPath;
     String _repeaterApSsid;
     IPAddress _repeaterApIp;
-    uint32_t _reconnectIntervalMs;
-    uint32_t _lastAttemptMs;
-    bool _retryArmed;
-    uint32_t _disconnectedSinceMs;
-    bool _disconnected;
+
+    // Scan-and-pounce reconnect state. Set from loop() except where noted.
+    bool _scanInFlight;
+    uint32_t _scanStartedMs;
+    uint32_t _lastScanMs;
+    uint8_t _softFailEventCount;
+    bool _hardFail;
+    uint32_t _lastBlindRetryMs;
+    bool _eventsRegistered;
+    // Written by the WiFi event task, read by loop().
+    volatile bool _disconnectEventPending;
+    volatile uint8_t _disconnectReason;
 
     bool ensureFilesystem();
     bool loadAndConnect();
-    void scheduleReconnect();
+    void registerWiFiEvents();
+    void startScan();
+    void pollScanCompletion();
+    void handleScanResult(int count);
+    void handleDisconnectEvent();
+    bool isHardFailReason(uint8_t reason) const;
+    String loadSavedSsid();
     void attemptReconnect();
     void startAccessPoint();
     void startRepeaterAccessPoint(const String& upstreamSsid,
