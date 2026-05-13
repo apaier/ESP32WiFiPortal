@@ -4,22 +4,20 @@ Tracked here until the repo is published on GitHub, then migrated to Issues.
 
 ## Functional features
 
-### 1. Reconfigure WiFi from UI while already connected
-The current form is most useful in AP mode. Once connected, hitting `/` should still let the user pick a different network and trigger a new connection attempt without manually wiping credentials.
+### 1. Reconfigure WiFi from UI while already connected — done
+`handleConfigPage` processes form submissions in any mode, and `tryConnect` is mode-agnostic. Hitting `/` from a connected client triggers a fresh association attempt without manually wiping credentials. The remaining gap is discoverability — finding the device's IP without inspecting the router — which is covered by #6 (mDNS).
 
-### 2. UI control for "reconnect every X minutes"
-A numeric field on the config page that sets a reconnect interval, persisted to LittleFS. `0` disables.
+### 2. UI control for "reconnect every X minutes" — superseded
+The reconnect path was reworked to be event-driven (soft-fail disconnect count) on the STA side and scan-cadenced on the AP side, so there's no single "interval" knob a user would tune. The tunable constants that survive (`kScanCadenceMs`, `kSoftFailEventsBeforeFallback`, `kBlindRetryFloorMs`) live in code rather than the UI. See [docs/wifi-recovery.md](docs/wifi-recovery.md).
 
-### 3. Periodic reconnect from AP mode when STA credentials exist
-When the device falls back to AP mode but `/wifi.json` exists, retry the saved network on the configured interval (#2). On success, switch to Station mode.
-
-When this lands, also stop the captive-portal `DNSServer` on the AP→STA transition (and re-start it on any STA→AP fallback). Today it's started once in `startAccessPoint()` and never stopped, which is correct only because the mode is fixed at boot.
+### 3. Periodic reconnect from AP mode when STA credentials exist — done
+Scan-and-pounce in AP mode: every `kScanCadenceMs` (30s) we run an async scan for the saved SSID; on a match, `attemptReconnect` runs and switches to Station mode on success. A 15-minute blind-retry floor handles hidden SSIDs and DFS-channel APs that don't appear in passive scans. The captive-portal `DNSServer` is explicitly stopped on AP→STA in `tryConnect` and re-started on STA→AP in `startAccessPoint`. See [docs/wifi-recovery.md](docs/wifi-recovery.md).
 
 ### 4. Configurable AP credentials via UI
 Today the AP is open and its name is whatever the sketch passes to `begin()`. Add fields for AP name + password and persist them.
 
 ### 6. mDNS / configurable hostname
-Optional `setHostname()` and mDNS announcement so the device is reachable as `mydevice.local` on the network.
+Optional `setHostname()` and mDNS announcement so the device is reachable as `mydevice.local` on the network. Also covers the discoverability gap from #1 — once connected, users need a stable name to reach the config form without hunting through the router's DHCP table.
 
 ### 7. Move sensitive data to a secure storage approach
 WiFi credentials currently sit in plaintext at `/wifi.json` on LittleFS. Move at minimum to NVS with encryption enabled, or use the ESP32 flash encryption / secure-boot story. Decide whether the same applies to AP password, API keys, or other consumer-supplied secrets.
