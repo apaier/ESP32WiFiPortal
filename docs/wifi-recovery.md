@@ -50,9 +50,9 @@ Transitions in plain English:
   arrived with a reason code that means "the credentials are wrong"
   (AUTH_FAIL, ASSOC_FAIL, HANDSHAKE_TIMEOUT, 4WAY_HANDSHAKE_TIMEOUT).
   Immediate fallback. We also call `WiFi.disconnect(false, true)` to
-  erase the chip's NVS credentials so it stops auto-reassociating with
-  bad creds. The user's `/wifi.json` is preserved so the portal can
-  prefill for editing.
+  erase the chip's auto-reconnect credentials so it stops
+  auto-reassociating with bad creds. The library's own Preferences
+  entries are preserved so the portal can prefill for editing.
 - **Connected/Repeating → AP mode (soft-fail)** — disconnect events with
   transient reasons (BEACON_TIMEOUT, NO_AP_FOUND, etc.) are counted.
   Each event increments `_softFailEventCount`. A successful `STA_GOT_IP`
@@ -88,10 +88,10 @@ When we enter AP mode we call `WiFi.setAutoReconnect(false)` and
 `WiFi.disconnect(false, false)` to stop the chip's auto-reassociation —
 exactly so scans aren't blocked. Then every `kScanCadenceMs` (30s) we
 run an async scan. When the saved SSID appears, we call
-`attemptReconnect()`, which loads `/wifi.json` and runs `tryConnect`. On
-success we drop out of AP mode (and `tryConnect` re-enables
-auto-reconnect for the new Connected state); on failure we log and stay
-in AP mode for the next scan.
+`attemptReconnect()`, which reads the credentials back from NVS and
+runs `tryConnect`. On success we drop out of AP mode (and `tryConnect`
+re-enables auto-reconnect for the new Connected state); on failure we
+log and stay in AP mode for the next scan.
 
 This is the path that handles "the router was off, then turned back on"
 without any user action.
@@ -126,16 +126,17 @@ Read from `info.wifi_sta_disconnected.reason` on
 | everything else              | Soft  | Default to "let count decide".   |
 
 Hard-fail flips `_hardFail = true`, calls `WiFi.disconnect(false, true)`
-to clear the chip's NVS-stored credentials, and immediately enters AP
-mode. `_hardFail` is cleared the next time `tryConnect` runs (which
+to clear the chip's auto-reconnect credentials, and immediately enters
+AP mode. `_hardFail` is cleared the next time `tryConnect` runs (which
 happens on a fresh form submission via the captive portal). The portal's
 periodic scan-and-pounce is suppressed while `_hardFail` is set so the
 device doesn't burn power retrying creds that can't work.
 
-`/wifi.json` is **not** wiped on hard-fail. The portal still has the
-bad SSID/password available to prefill so the user can edit instead of
-retyping from scratch. The chip-internal NVS credentials are the only
-thing cleared.
+The library's Preferences entries are **not** wiped on hard-fail. The
+portal still has the bad SSID/password available to prefill so the user
+can edit instead of retyping from scratch. The chip-internal credentials
+(separate from our `wifi_portal` namespace, written by
+`esp_wifi_set_config`) are the only thing cleared.
 
 ## Auto-reconnect lifecycle
 
@@ -176,6 +177,9 @@ case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
 case ARDUINO_EVENT_WIFI_STA_GOT_IP:
     _softFailEventCount = 0;
     // ... NAPT on if Repeating
+case ARDUINO_EVENT_WIFI_AP_START:
+    // ... NAPT on if Repeating and STA is up; covers the race where
+    // softAP() returns before the new netif is fully online.
 ```
 
 The disconnect-pending fields are `volatile` to prevent the compiler
@@ -194,6 +198,28 @@ NAPT toggling for repeater mode happens directly inside the event handler
 because `WiFi.AP.enableNAPT(bool)` is a thin shim and works fine from
 event-task context. If you add anything more involved to the handler,
 move it to a "drain in loop" path like `handleDisconnectEvent`.
+
+`startRepeaterAccessPoint` sets `_mode = Repeating` *before* its direct
+`enableNAPT(true)` call, specifically so the asynchronous `AP_START`
+event for the new SSID can re-enable NAPT once the netif is actually
+online. `softAP()` returns before that event fires, so the direct call
+alone is racy — it works when the netif is already up, but on faster
+boot paths (e.g. after the LittleFS→NVS storage change shortened the
+window between `STA_GOT_IP` and the NAPT enable) it can land before the
+new netif is configured, silently no-op, and leave the repeater AP up
+but unbridged. The event-handler path is the safety net.
+
+`STA_GOT_IP` does a **toggle** on NAPT (off then on) rather than a plain
+re-enable, and refreshes the DHCP DNS option via `refreshRepeaterDhcpDns`.
+Reason: a stale NAT table — left over from a reconnect where the STA
+briefly landed on a different subnet — is not cleared by a second
+`enableNAPT(true)`. lwIP treats that as a no-op. Calling
+`enableNAPT(false)` first frees the table; the immediate `true` after
+rebuilds it against the current STA gateway. The DNS refresh covers
+the matching case on the DHCP-server side: clients otherwise keep
+receiving whatever DNS was captured at the first `softAPConfig` call,
+even if it's now unroutable through NAPT. Both happen in the event
+handler — synchronous lwIP calls, cheap, run on the WiFi event task.
 
 ## Tuning parameters
 

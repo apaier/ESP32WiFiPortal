@@ -1,9 +1,9 @@
 #include "ESP32WiFiPortal.h"
 
-#include <ArduinoJson.h>
-#include <LittleFS.h>
 #include <WiFi.h>
 #include <esp_netif.h>
+
+#include "generated/embedded_assets.h"
 
 namespace {
 constexpr uint32_t kConnectAttemptSeconds = 30;
@@ -11,12 +11,14 @@ constexpr uint32_t kScanCadenceMs = 30UL * 1000UL;
 constexpr uint32_t kScanTimeoutMs = 15UL * 1000UL;
 constexpr uint32_t kBlindRetryFloorMs = 15UL * 60UL * 1000UL;
 constexpr uint8_t kSoftFailEventsBeforeFallback = 10;
-constexpr const char* kJsonNetworkKey = "network";
-constexpr const char* kJsonPasswordKey = "password";
-constexpr const char* kJsonModeKey = "mode";
+constexpr const char* kPrefsNamespace = "wifi_portal";
+constexpr const char* kPrefNetworkKey = "network";
+constexpr const char* kPrefPasswordKey = "password";
+constexpr const char* kPrefModeKey = "mode";
 constexpr const char* kModeClient = "client";
 constexpr const char* kModeRepeater = "repeater";
 constexpr const char* kRepeaterApSuffix = "-extender";
+constexpr const char* kHtmlAssetName = "WiFiSetup.html";
 
 uint32_t ipToU32(const IPAddress& ip) {
     return ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) |
@@ -28,10 +30,10 @@ ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
     : _server(port),
       _ledPin(-1),
       _mode(WiFiPortalMode::AccessPoint),
-      _fsReady(false),
+      _prefsReady(false),
       _pagesRegistered(false),
-      _htmlPath("/WiFiSetup.html"),
-      _configPath("/wifi.json"),
+      _htmlOverride(nullptr),
+      _htmlOverrideLen(0),
       _scanInFlight(false),
       _scanStartedMs(0),
       _lastScanMs(0),
@@ -47,7 +49,7 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
     _apName = accessPointName;
     _apPassword = accessPointPassword;
 
-    if (!ensureFilesystem()) {
+    if (!ensurePreferences()) {
         return;
     }
 
@@ -76,7 +78,7 @@ void ESP32WiFiPortal::loop() {
     }
 
     bool inApMode = (_mode == WiFiPortalMode::AccessPoint);
-    bool haveCreds = _fsReady && LittleFS.exists(_configPath);
+    bool haveCreds = haveSavedCredentials();
     if (inApMode && haveCreds && !_hardFail && !_scanInFlight) {
         if ((millis() - _lastScanMs) >= kScanCadenceMs) {
             startScan();
@@ -109,45 +111,40 @@ void ESP32WiFiPortal::on(const char* uri, WebServer::THandlerFunction handler) {
 }
 
 void ESP32WiFiPortal::setLedPin(int pin) { _ledPin = pin; }
-void ESP32WiFiPortal::setHtmlPath(const String& path) { _htmlPath = path; }
-void ESP32WiFiPortal::setConfigPath(const String& path) { _configPath = path; }
 
-bool ESP32WiFiPortal::ensureFilesystem() {
-    if (_fsReady) return true;
-    if (!LittleFS.begin(true)) {
-        Serial.println("[ESP32WiFiPortal] Failed to mount LittleFS");
+void ESP32WiFiPortal::setHtml(const uint8_t* html, size_t length) {
+    _htmlOverride = html;
+    _htmlOverrideLen = length;
+}
+
+bool ESP32WiFiPortal::ensurePreferences() {
+    if (_prefsReady) return true;
+    if (!_prefs.begin(kPrefsNamespace, /*readOnly=*/false)) {
+        Serial.println("[ESP32WiFiPortal] Failed to open Preferences namespace");
         return false;
     }
-    _fsReady = true;
-    Serial.println("[ESP32WiFiPortal] LittleFS mounted");
+    _prefsReady = true;
+    Serial.println("[ESP32WiFiPortal] Preferences opened");
     return true;
 }
 
+bool ESP32WiFiPortal::haveSavedCredentials() {
+    return _prefsReady && _prefs.isKey(kPrefNetworkKey);
+}
+
 bool ESP32WiFiPortal::loadAndConnect() {
-    if (!LittleFS.exists(_configPath)) {
+    if (!haveSavedCredentials()) {
         Serial.println("[ESP32WiFiPortal] No saved credentials");
         return false;
     }
-    File file = LittleFS.open(_configPath, FILE_READ);
-    if (!file) {
-        Serial.println("[ESP32WiFiPortal] Failed to open config file");
-        return false;
-    }
-    String content = file.readString();
-    file.close();
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, content);
-    if (err) {
-        Serial.print("[ESP32WiFiPortal] Config parse error: ");
-        Serial.println(err.c_str());
-        return false;
-    }
-
-    String network = doc[kJsonNetworkKey].as<String>();
-    String password = doc[kJsonPasswordKey].as<String>();
-    String mode = doc[kJsonModeKey].as<String>();
+    String network = _prefs.getString(kPrefNetworkKey, String());
+    String password = _prefs.getString(kPrefPasswordKey, String());
+    String mode = _prefs.getString(kPrefModeKey, kModeClient);
     if (mode != kModeRepeater) mode = kModeClient;
+    if (network.length() == 0) {
+        Serial.println("[ESP32WiFiPortal] Saved network key is empty");
+        return false;
+    }
     return tryConnect(network, password, mode);
 }
 
@@ -170,6 +167,24 @@ void ESP32WiFiPortal::registerWiFiEvents() {
             case ARDUINO_EVENT_WIFI_STA_GOT_IP:
                 _softFailEventCount = 0;
                 if (_mode == WiFiPortalMode::Repeating) {
+                    // Force-reset NAPT: an enabled-but-stuck NAT table
+                    // (e.g. left over from a reconnect where the STA
+                    // briefly landed on a different subnet) won't be
+                    // recovered by a second enable(true), so we toggle
+                    // off then on to make lwIP rebuild the tables
+                    // against the current STA IP/gateway.
+                    WiFi.AP.enableNAPT(false);
+                    WiFi.AP.enableNAPT(true);
+                    refreshRepeaterDhcpDns();
+                }
+                break;
+            case ARDUINO_EVENT_WIFI_AP_START:
+                // softAP() returns before the new netif is fully up, so the
+                // direct enableNAPT() call in startRepeaterAccessPoint can
+                // race with the netif coming online. Re-enable here once
+                // we see the AP_START event for the new SSID/IP.
+                if (_mode == WiFiPortalMode::Repeating &&
+                    WiFi.status() == WL_CONNECTED) {
                     WiFi.AP.enableNAPT(true);
                 }
                 break;
@@ -222,14 +237,8 @@ void ESP32WiFiPortal::handleDisconnectEvent() {
 }
 
 String ESP32WiFiPortal::loadSavedSsid() {
-    if (!_fsReady || !LittleFS.exists(_configPath)) return String();
-    File file = LittleFS.open(_configPath, FILE_READ);
-    if (!file) return String();
-    String content = file.readString();
-    file.close();
-    JsonDocument doc;
-    if (deserializeJson(doc, content)) return String();
-    return doc[kJsonNetworkKey].as<String>();
+    if (!_prefsReady) return String();
+    return _prefs.getString(kPrefNetworkKey, String());
 }
 
 void ESP32WiFiPortal::startScan() {
@@ -288,7 +297,7 @@ void ESP32WiFiPortal::handleScanResult(int count) {
 }
 
 void ESP32WiFiPortal::attemptReconnect() {
-    if (!LittleFS.exists(_configPath)) return;
+    if (!haveSavedCredentials()) return;
     Serial.println("[ESP32WiFiPortal] Attempting saved network");
     if (!loadAndConnect()) {
         startAccessPoint();
@@ -422,6 +431,33 @@ IPAddress ESP32WiFiPortal::pickRepeaterSubnet() const {
     return IPAddress(192, 168, 244, 1);
 }
 
+void ESP32WiFiPortal::refreshRepeaterDhcpDns() {
+    // The AP's DHCP server caches whatever DNS we passed to softAPConfig
+    // at first setup. If the STA later (re)associates and learns a
+    // different upstream DNS — or, in the failure case from the field,
+    // the STA briefly landed on a different subnet during reconnect and
+    // we captured a DNS that no longer routes — clients keep getting
+    // the stale value until they rejoin. Pull the current STA-side DNS
+    // and re-stamp the AP's DHCP DNS option without restarting the AP.
+    IPAddress dns = WiFi.dnsIP(0);
+    if ((uint32_t)dns == 0) dns = IPAddress(8, 8, 4, 4);
+    esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (apNetif == nullptr) return;
+
+    esp_netif_dns_info_t info = {};
+    info.ip.type = ESP_IPADDR_TYPE_V4;
+    info.ip.u_addr.ip4.addr = static_cast<uint32_t>(dns);
+    esp_netif_dhcps_stop(apNetif);
+    esp_err_t err = esp_netif_set_dns_info(apNetif, ESP_NETIF_DNS_MAIN, &info);
+    esp_netif_dhcps_start(apNetif);
+    if (err != ESP_OK) {
+        Serial.printf("[ESP32WiFiPortal] DHCP DNS refresh failed: 0x%x\n", err);
+    } else {
+        Serial.printf("[ESP32WiFiPortal] DHCP DNS set to %s\n",
+                      dns.toString().c_str());
+    }
+}
+
 void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
                                                const String& upstreamPassword) {
     _repeaterApIp = pickRepeaterSubnet();
@@ -452,40 +488,31 @@ void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
                   _repeaterApSsid.c_str(),
                   _repeaterApIp.toString().c_str());
 
-    // NAPT toggling on STA up/down is handled by the global event handler
-    // installed in registerWiFiEvents().
-    WiFi.AP.enableNAPT(true);
-
+    // Set the mode *before* enabling NAPT so the AP_START event handler
+    // (which fires asynchronously after softAP() returns, once the new
+    // netif is actually up) sees Repeating and re-enables NAPT cleanly.
+    // The direct call below is best-effort: it covers the case where the
+    // netif is already up by this point. Subsequent STA up/down is handled
+    // by the global event handler in registerWiFiEvents().
     _mode = WiFiPortalMode::Repeating;
+    WiFi.AP.enableNAPT(true);
 }
 
 void ESP32WiFiPortal::persistCredentials(const String& network,
                                          const String& password,
                                          const String& mode) {
-    if (!_fsReady) return;
-    LittleFS.remove(_configPath);
-    File file = LittleFS.open(_configPath, FILE_WRITE);
-    if (!file) {
-        Serial.println("[ESP32WiFiPortal] Failed to open config for writing");
-        return;
-    }
-    JsonDocument doc;
-    doc[kJsonNetworkKey] = network;
-    doc[kJsonPasswordKey] = password;
-    doc[kJsonModeKey] = (mode == kModeRepeater) ? kModeRepeater : kModeClient;
-    String payload;
-    serializeJson(doc, payload);
-    if (!file.print(payload)) {
-        Serial.println("[ESP32WiFiPortal] Config write failed");
-    }
-    file.close();
+    if (!_prefsReady) return;
+    _prefs.putString(kPrefNetworkKey, network);
+    _prefs.putString(kPrefPasswordKey, password);
+    _prefs.putString(kPrefModeKey,
+                     (mode == kModeRepeater) ? kModeRepeater : kModeClient);
 }
 
 void ESP32WiFiPortal::handleConfigPage() {
-    if (_server.hasArg(kJsonNetworkKey)) {
-        String submittedMode = _server.arg(kJsonModeKey);
+    if (_server.hasArg(kPrefNetworkKey)) {
+        String submittedMode = _server.arg(kPrefModeKey);
         if (submittedMode != kModeRepeater) submittedMode = kModeClient;
-        tryConnect(_server.arg(kJsonNetworkKey), _server.arg(kJsonPasswordKey),
+        tryConnect(_server.arg(kPrefNetworkKey), _server.arg(kPrefPasswordKey),
                    submittedMode);
     }
 
@@ -501,14 +528,18 @@ void ESP32WiFiPortal::handleConfigPage() {
         options += "</option>";
     }
 
-    File file = LittleFS.open(_htmlPath, FILE_READ);
-    if (!file) {
+    const uint8_t* htmlBytes = _htmlOverride;
+    size_t htmlLen = _htmlOverrideLen;
+    if (htmlBytes == nullptr) {
+        htmlBytes = getEmbeddedAsset(kHtmlAssetName, &htmlLen);
+    }
+    if (htmlBytes == nullptr || htmlLen == 0) {
         _server.send(500, "text/plain",
-                     "Config HTML missing. Upload " + _htmlPath + " to LittleFS.");
+                     "Config HTML missing. Regenerate src/generated/ via "
+                     "tools/embed_assets.py or call setHtml().");
         return;
     }
-    String html = file.readString();
-    file.close();
+    String html(reinterpret_cast<const char*>(htmlBytes), htmlLen);
 
     String status;
     if (_mode == WiFiPortalMode::Repeating) {

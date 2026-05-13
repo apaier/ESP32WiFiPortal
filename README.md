@@ -4,11 +4,15 @@ A reusable WiFi configuration portal for ESP32 sketches. Drop it into a project 
 
 ## What it does
 
-- On boot, mounts LittleFS and reads `/wifi.json` for saved credentials.
+- On boot, opens an NVS namespace via the `Preferences` API and reads saved credentials.
 - If credentials exist, attempts to join the network (30s timeout).
 - If no credentials exist, or the join fails, starts an open Access Point and serves a configuration page on `/` and `/wifi`.
-- Submitting the form retries connection. On success, saves credentials to LittleFS and switches the device into Station mode — or into Repeater mode, if that was selected on the form (see below).
+- Submitting the form retries connection. On success, saves credentials to NVS and switches the device into Station mode — or into Repeater mode, if that was selected on the form (see below).
 - Exposes the underlying `WebServer` so consumers can register their own routes (status pages, REST endpoints, etc).
+
+The config-form HTML lives in the library's `data/` directory and is compiled into the firmware at build time as a PROGMEM byte array, so there is no filesystem-upload step. See [docs/embedded-assets.md](docs/embedded-assets.md) for how that works and how to customise the form.
+
+Credentials are stored in NVS rather than on a user-visible filesystem, but **NVS itself is not encrypted by default** — bits on flash are still readable by anyone with a flash dump. See [docs/secure-credentials.md](docs/secure-credentials.md) for the threat model and the consumer-side opt-in for real encryption.
 
 ### Repeater mode
 
@@ -24,6 +28,8 @@ The config form has a Client / Repeater radio button. When Repeater is chosen an
 
 This library targets **Arduino-ESP32 3.x** (ESP-IDF v5.1+) so it can use `ESP_NETIF_CAPTIVEPORTAL_URI` (RFC 7710 / DHCP option 114) for reliable captive-portal detection on iOS, Android, and macOS. The official `platformio/platform-espressif32` still ships Arduino-ESP32 2.0.17, so use the [`pioarduino/platform-espressif32`](https://github.com/pioarduino/platform-espressif32) community fork until that catches up.
 
+The build also needs **Python 3** on `PATH` to regenerate `src/generated/` from `data/`. PlatformIO already requires Python for its own toolchain, so this is normally free; Arduino IDE users only need it if they intend to edit files under `data/`.
+
 ## Install
 
 ### PlatformIO
@@ -35,11 +41,11 @@ In your project's `platformio.ini`:
 platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.38-1/platform-espressif32.zip
 board = esp32doit-devkit-v1
 framework = arduino
-board_build.filesystem = littlefs
 lib_deps =
     https://github.com/apaier/ESP32WiFiPortal.git
-    bblanchon/ArduinoJson@^7.0.0
 ```
+
+No `board_build.filesystem` line and no `uploadfs` step — the HTML is compiled in. The `tools/embed_assets.py` regenerator runs automatically as part of the library build via the `build.extraScript` hook in `library.json`.
 
 During local development before publishing, point at a checkout instead:
 
@@ -50,7 +56,15 @@ lib_deps = ESP32WiFiPortal
 
 ### Arduino IDE
 
-Clone this repository into `~/Documents/Arduino/libraries/ESP32WiFiPortal/`, then restart the IDE. ArduinoJson must be installed separately via Library Manager.
+Clone this repository into `~/Documents/Arduino/libraries/ESP32WiFiPortal/`, then restart the IDE. No external library dependencies.
+
+The Arduino IDE has no pre-build hook a library can rely on, so `src/generated/embedded_assets.{h,cpp}` are checked into the repo and built as-is. If you edit anything under `data/`, run the regenerator once before compiling:
+
+```sh
+python3 tools/embed_assets.py
+```
+
+(PlatformIO users don't need this — the same script runs automatically during the build.)
 
 ## Quickstart
 
@@ -69,10 +83,7 @@ void loop() {
 }
 ```
 
-Then upload `data/WiFiSetup.html` to LittleFS:
-
-- PlatformIO: `pio run -t uploadfs`
-- Arduino IDE: use the LittleFS upload plugin (`arduino-esp32fs-plugin` for ESP32).
+That's it. No filesystem upload.
 
 ## Adding your own pages
 
@@ -108,14 +119,15 @@ IPAddress      getIP() const;
 WebServer&     server();
 void           on(const char* uri, WebServer::THandlerFunction handler);
 
-void setLedPin(int pin);              // optional connection indicator
-void setHtmlPath(const String& path); // default "/WiFiSetup.html"
-void setConfigPath(const String& path);// default "/wifi.json"
+void setLedPin(int pin);                          // optional connection indicator
+void setHtml(const uint8_t* html, size_t length); // override the compiled-in form
 ```
 
 ## Customising the HTML
 
-The library reads `/WiFiSetup.html` from LittleFS at request time and substitutes four placeholders:
+`data/WiFiSetup.html` is the source of truth for the config form. Edit it like any other file in the repository, then rebuild — PlatformIO regenerates `src/generated/` automatically; Arduino IDE users run `python3 tools/embed_assets.py` first. See [docs/embedded-assets.md](docs/embedded-assets.md) for details on the `data/` → PROGMEM pipeline and on dropping additional assets in.
+
+The library substitutes four placeholders at request time:
 
 - `***options***` — `<option>` tags for each scanned network.
 - `***Connection Status***` — current connection state.
@@ -123,9 +135,17 @@ The library reads `/WiFiSetup.html` from LittleFS at request time and substitute
 
 You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present.
 
+If you'd rather not touch `data/` at all, call `portal.setHtml(myHtmlBytes, myHtmlLen)` before `begin()` to override the compiled-in copy at runtime. The pointer must remain valid for the lifetime of the portal.
+
 ## Examples
 
 - **BasicConfigPortal** — minimal sketch showing the default behaviour, including Client/Repeater mode selection on the config form.
+
+## Documentation
+
+- [docs/secure-credentials.md](docs/secure-credentials.md) — where credentials are stored, what NVS does and doesn't protect, how to opt into real encryption.
+- [docs/embedded-assets.md](docs/embedded-assets.md) — how the `data/` directory is compiled into the firmware, and how to add or override assets.
+- [docs/wifi-recovery.md](docs/wifi-recovery.md) — connection-loss recovery, scan-and-pounce, hard/soft fail classification.
 
 ## Roadmap
 

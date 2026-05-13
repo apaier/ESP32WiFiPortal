@@ -1,8 +1,8 @@
 {
   "name": "ESP32WiFiPortal",
-  "version": "0.1.0",
-  "description": "ESP32 WiFi configuration portal with built-in web server and LittleFS. Connects to a saved network on boot, falls back to an Access Point with a configuration form, and exposes the WebServer for additional handlers.",
-  "keywords": "esp32, wifi, portal, captive, webserver, littlefs, configuration",
+  "version": "0.2.0",
+  "description": "ESP32 WiFi configuration portal with built-in web server. Connects to a saved network on boot, falls back to an Access Point with a configuration form, and exposes the WebServer for additional handlers. Credentials live in NVS via the Preferences API; the config-form HTML is compiled into the firmware at build time.",
+  "keywords": "esp32, wifi, portal, captive, webserver, nvs, preferences, configuration",
   "repository": {
     "type": "git",
     "url": "https://github.com/apaier/ESP32WiFiPortal.git"
@@ -18,7 +18,7 @@
   "frameworks": "arduino",
   "platforms": "espressif32",
   "headers": "ESP32WiFiPortal.h",
-  "dependencies": {
-    "bblanchon/ArduinoJson": "^7.0.0"
+  "build": {
+    "extraScript": "tools/embed_assets.py"
   }
 }

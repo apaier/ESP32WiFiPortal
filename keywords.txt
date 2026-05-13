@@ -21,8 +21,7 @@ getIP	KEYWORD2
 server	KEYWORD2
 on	KEYWORD2
 setLedPin	KEYWORD2
-setHtmlPath	KEYWORD2
-setConfigPath	KEYWORD2
+setHtml	KEYWORD2
 
 #######################################
 # Constants (LITERAL1)
@@ -30,3 +29,4 @@ setConfigPath	KEYWORD2
 
 AccessPoint	LITERAL1
 Connected	LITERAL1
+Repeating	LITERAL1

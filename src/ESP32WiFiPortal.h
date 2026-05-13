@@ -1,11 +1,13 @@
 /*
   ESP32WiFiPortal - Captive-portal style WiFi configuration for ESP32
 
-  On begin(), reads saved credentials from LittleFS and tries to join the
-  configured network. If no credentials exist or the join fails, the device
-  starts an open Access Point and serves a configuration page so a user can
-  pick a network and submit credentials. The underlying WebServer is exposed
-  so consumers can add their own handlers.
+  On begin(), reads saved credentials from NVS (via the Preferences API)
+  and tries to join the configured network. If no credentials exist or
+  the join fails, the device starts an open Access Point and serves a
+  configuration page so a user can pick a network and submit credentials.
+  The HTML form is compiled into the firmware from data/WiFiSetup.html
+  at build time. The underlying WebServer is exposed so consumers can
+  add their own handlers.
 
   Copyright (C) 2026 Andrew Paier
 
@@ -26,6 +28,7 @@
 #include <Arduino.h>
 #include <DNSServer.h>
 #include <IPAddress.h>
+#include <Preferences.h>
 #include <WebServer.h>
 
 enum class WiFiPortalMode { AccessPoint, Connected, Repeating };
@@ -34,9 +37,9 @@ class ESP32WiFiPortal {
 public:
     explicit ESP32WiFiPortal(uint16_t port = 80);
 
-    // Initialise LittleFS, attempt to join saved network, register routes,
-    // and start the WebServer. accessPointName is used as the SSID when the
-    // device falls back to AP mode.
+    // Open the Preferences namespace, attempt to join the saved network,
+    // register routes, and start the WebServer. accessPointName is used
+    // as the SSID when the device falls back to AP mode.
     void begin(const String& accessPointName,
                const String& accessPointPassword = String());
 
@@ -54,21 +57,25 @@ public:
     void on(const char* uri, WebServer::THandlerFunction handler);
 
     // Optional configuration. Call before begin().
-    void setLedPin(int pin);                         // -1 disables (default)
-    void setHtmlPath(const String& path);            // default "/WiFiSetup.html"
-    void setConfigPath(const String& path);          // default "/wifi.json"
+    void setLedPin(int pin);                          // -1 disables (default)
+
+    // Override the config-form HTML at runtime. Defaults to the build-time
+    // embedded copy of data/WiFiSetup.html. The pointer must remain valid
+    // for the lifetime of the portal; the bytes are not copied.
+    void setHtml(const uint8_t* html, size_t length);
 
 private:
     WebServer _server;
     DNSServer _dns;
+    Preferences _prefs;
     int _ledPin;
     WiFiPortalMode _mode;
-    bool _fsReady;
+    bool _prefsReady;
     bool _pagesRegistered;
     String _apName;
     String _apPassword;
-    String _htmlPath;
-    String _configPath;
+    const uint8_t* _htmlOverride;
+    size_t _htmlOverrideLen;
     String _repeaterApSsid;
     IPAddress _repeaterApIp;
 
@@ -84,9 +91,11 @@ private:
     volatile bool _disconnectEventPending;
     volatile uint8_t _disconnectReason;
 
-    bool ensureFilesystem();
+    bool ensurePreferences();
+    bool haveSavedCredentials();
     bool loadAndConnect();
     void registerWiFiEvents();
+    void refreshRepeaterDhcpDns();
     void startScan();
     void pollScanCompletion();
     void handleScanResult(int count);

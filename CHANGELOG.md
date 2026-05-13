@@ -2,10 +2,16 @@
 
 ## 0.2.0 - Unreleased
 
+- **Breaking:** credentials moved from `/wifi.json` on LittleFS to NVS via the Arduino `Preferences` API, under the namespace `wifi_portal` with keys `network`, `password`, `mode`. Existing 0.1.x installs need to re-enter credentials once after the upgrade — there is no on-device migration path, by design (carrying it would have required keeping the LittleFS dependency for one transitional release). NVS storage is not encrypted by default; see [docs/secure-credentials.md](docs/secure-credentials.md) for the threat model and the consumer-side opt-in for real encryption.
+- **Breaking:** `data/WiFiSetup.html` (and anything else under `data/`) is now compiled into the firmware at build time as a `PROGMEM` byte array via [tools/embed_assets.py](tools/embed_assets.py). No filesystem-upload step is required (no more `pio run -t uploadfs`). PlatformIO runs the regenerator automatically via `library.json`'s `build.extraScript`; Arduino IDE users must run `python3 tools/embed_assets.py` after editing anything in `data/`. The generated `src/generated/embedded_assets.{h,cpp}` are checked into the repo so out-of-the-box Arduino IDE builds work.
+- **Breaking:** removed `setHtmlPath()` and `setConfigPath()`. The HTML is now identified by its name under `data/` (default `WiFiSetup.html`); credentials live in NVS under a fixed namespace.
+- Added `setHtml(const uint8_t* html, size_t length)` for callers who want to override the compiled-in form at runtime without editing `data/`.
+- Library no longer depends on `ArduinoJson` or `LittleFS`. Net flash usage is smaller in most consumer projects.
 - Repeater mode. The config form now has a Client / Repeater radio. When Repeater is selected and the upstream join succeeds, the device brings up an AP on a non-overlapping `/24` (default candidates `192.168.244.0/24`, `10.244.0.0/24`, `172.31.244.0/24`), SSID `<upstream>-extender`, same password as upstream, with NAPT forwarding enabled via `WiFi.AP.enableNAPT`. Falls back to AP config mode unchanged if the upstream join fails.
 - A `Network.onEvent` handler toggles NAPT on `STA_GOT_IP` / `STA_DISCONNECTED` / `STA_LOST_IP` so a brief upstream outage doesn't strand the AP with stale forwarding state.
 - Added `WiFiPortalMode::Repeating` state. `getIP()` returns the STA IP in this state; the captive-portal DNSServer, redirect, and DHCP option 114 do not run.
-- HTML config page gained two new substitution tokens: `***client_checked***` and `***repeater_checked***`. `/wifi.json` gained a `mode` field (`"client"` or `"repeater"`); missing values default to `"client"` so existing installs upgrade cleanly.
+- HTML config page gained two new substitution tokens: `***client_checked***` and `***repeater_checked***`. The persisted record gained a `mode` field (`"client"` or `"repeater"`); missing values default to `"client"`.
+- Repeater recovery hardening: on `STA_GOT_IP` in Repeating mode, NAPT is now toggled off→on (a plain re-enable is a no-op against a stuck NAT table) and the AP's DHCP DNS option is re-stamped from the current `WiFi.dnsIP(0)` via `esp_netif_set_dns_info`. Catches the "STA briefly landed on the wrong subnet during reconnect, captured a now-unreachable DNS, NAT tables pointed at a dead gateway" failure mode that left clients associated but cut off. The `AP_START` event also re-enables NAPT to cover the synchronous-softAP-vs-async-netif race on initial setup. See [docs/wifi-recovery.md](docs/wifi-recovery.md).
 
 ## 0.1.0 - Unreleased
 
