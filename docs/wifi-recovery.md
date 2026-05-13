@@ -210,16 +210,59 @@ new netif is configured, silently no-op, and leave the repeater AP up
 but unbridged. The event-handler path is the safety net.
 
 `STA_GOT_IP` does a **toggle** on NAPT (off then on) rather than a plain
-re-enable, and refreshes the DHCP DNS option via `refreshRepeaterDhcpDns`.
-Reason: a stale NAT table — left over from a reconnect where the STA
-briefly landed on a different subnet — is not cleared by a second
-`enableNAPT(true)`. lwIP treats that as a no-op. Calling
-`enableNAPT(false)` first frees the table; the immediate `true` after
-rebuilds it against the current STA gateway. The DNS refresh covers
-the matching case on the DHCP-server side: clients otherwise keep
-receiving whatever DNS was captured at the first `softAPConfig` call,
-even if it's now unroutable through NAPT. Both happen in the event
-handler — synchronous lwIP calls, cheap, run on the WiFi event task.
+re-enable, and updates the `DnsForwarder`'s upstream via
+`refreshRepeaterUpstream`. Reason: a stale NAT table — left over from
+a reconnect where the STA briefly landed on a different subnet — is
+not cleared by a second `enableNAPT(true)`. lwIP treats that as a
+no-op. Calling `enableNAPT(false)` first frees the table; the immediate
+`true` after rebuilds it against the current STA gateway. The
+forwarder upstream update covers the matching case on the DNS side:
+clients otherwise pin to whatever DNS was current at first
+`startRepeaterAccessPoint` and silently fail to resolve when upstream's
+resolver changes or moves out of reach. Both happen in the event
+handler — synchronous lwIP / IPAddress writes, cheap, run on the WiFi
+event task.
+
+## DnsService: one owner of port 53
+
+A single `DnsService` instance (`src/DnsService.{h,cpp}`) owns UDP
+port 53 for the device's entire lifetime. It binds the listener once
+during `ESP32WiFiPortal::begin()` and never rebinds — only its internal
+dispatch mode changes as the portal transitions:
+
+- **Off** — drop every incoming query. Used in plain Connected/client
+  mode where the device shouldn't be answering DNS at all.
+- **CaptivePortal** — answer every A query with the AP IP. Triggers
+  iOS/Android/macOS captive-network detection on join, same role the
+  old Arduino-ESP32 `DNSServer` filled.
+- **Forwarder** — proxy queries to a configurable upstream resolver,
+  match responses back to the originating client by DNS transaction
+  ID. In-flight queries live in a fixed 16-slot table, time out after
+  5 s. Used in repeater mode so AP clients get a stable DNS pointer
+  (the AP IP) that survives upstream DNS changes — the service just
+  retargets its `_upstream` field on every `STA_GOT_IP` event.
+
+In Forwarder mode a second socket (`_uplink`) is bound to `INADDR_ANY:0`
+for outgoing queries. A specific-IP bind can't route out a different
+netif (lwIP refuses, returns `ENOMEM`), so the uplink stays on ANY and
+lwIP picks the right source IP per destination. Queries from outside
+the AP subnet are dropped to avoid acting as an open resolver for
+whatever is on the STA-side LAN.
+
+### Why one socket for life
+
+This design exists because Arduino-ESP32's `DNSServer.stop()` doesn't
+synchronously release its lwIP UDP socket binding on the pioarduino
+builds the library targets. The socket sits in the PCB list past
+`close()`, and any subsequent component trying to bind port 53 — even
+on a specific local IP — gets `EADDRINUSE`. We saw this in the field
+when the library previously used `DNSServer` for captive portal and a
+separate `WiFiUDP` for the repeater forwarder: the transition
+`AP fallback → form submit → repeater` reliably failed the forwarder's
+bind. Holding port 53 ourselves from the very first call to
+`ESP32WiFiPortal::begin()` and never re-binding sidesteps the race
+entirely. The cost is one always-bound UDP socket worth of RAM,
+roughly nothing.
 
 ## Tuning parameters
 

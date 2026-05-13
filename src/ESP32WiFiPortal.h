@@ -26,10 +26,11 @@
 #define ESP32_WIFI_PORTAL_H
 
 #include <Arduino.h>
-#include <DNSServer.h>
 #include <IPAddress.h>
 #include <Preferences.h>
 #include <WebServer.h>
+
+#include "DnsService.h"
 
 enum class WiFiPortalMode { AccessPoint, Connected, Repeating };
 
@@ -66,7 +67,7 @@ public:
 
 private:
     WebServer _server;
-    DNSServer _dns;
+    DnsService _dns;
     Preferences _prefs;
     int _ledPin;
     WiFiPortalMode _mode;
@@ -95,7 +96,7 @@ private:
     bool haveSavedCredentials();
     bool loadAndConnect();
     void registerWiFiEvents();
-    void refreshRepeaterDhcpDns();
+    void refreshRepeaterUpstream();
     void startScan();
     void pollScanCompletion();
     void handleScanResult(int count);

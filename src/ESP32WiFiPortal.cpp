@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_netif.h>
 
+#include "DnsService.h"
 #include "generated/embedded_assets.h"
 
 namespace {
@@ -53,6 +54,15 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
         return;
     }
 
+    // DnsService binds port 53 lazily on the first setMode(non-Off)
+    // call (from startAccessPoint or startRepeaterAccessPoint, both
+    // of which run WiFi.mode() first and therefore have an
+    // initialized lwIP stack to talk to). Binding earlier than that
+    // — e.g. here, before any WiFi call — trips an
+    // xQueueSemaphoreTake assert because the network task hasn't been
+    // created yet. Once bound, the socket stays bound for the rest of
+    // the device's lifetime; only the dispatch mode flips.
+
     registerWiFiEvents();
 
     if (!loadAndConnect()) {
@@ -64,9 +74,7 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 }
 
 void ESP32WiFiPortal::loop() {
-    if (_mode == WiFiPortalMode::AccessPoint) {
-        _dns.processNextRequest();
-    }
+    _dns.loop();
 
     if (_scanInFlight) {
         pollScanCompletion();
@@ -175,7 +183,7 @@ void ESP32WiFiPortal::registerWiFiEvents() {
                     // against the current STA IP/gateway.
                     WiFi.AP.enableNAPT(false);
                     WiFi.AP.enableNAPT(true);
-                    refreshRepeaterDhcpDns();
+                    refreshRepeaterUpstream();
                 }
                 break;
             case ARDUINO_EVENT_WIFI_AP_START:
@@ -308,6 +316,11 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
                                  const String& mode) {
     _hardFail = false;
     _softFailEventCount = 0;
+    // Switch DNS off while we transition. CaptivePortal-mode lying and
+    // Forwarder-mode proxying both stop making sense the moment the AP
+    // goes away; we'll re-arm whichever mode is appropriate once the
+    // new state is established. The listener socket stays bound.
+    _dns.setMode(DnsService::Mode::Off);
     // Re-arm chip-level auto-reconnect so transient drops after a
     // successful association recover on their own (we may have left it
     // off after a prior AP fallback).
@@ -330,7 +343,6 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
         return false;
     }
 
-    _dns.stop();
     _mode = WiFiPortalMode::Connected;
     if (_ledPin >= 0) digitalWrite(_ledPin, HIGH);
     Serial.print("[ESP32WiFiPortal] Connected, IP ");
@@ -351,6 +363,7 @@ void ESP32WiFiPortal::startAccessPoint() {
     // to settle before we steal radio time again.
     _lastScanMs = millis();
     _lastBlindRetryMs = millis();
+    _dns.setMode(DnsService::Mode::Off);
     Serial.println("[ESP32WiFiPortal] Starting Access Point");
 
     // Halt the chip's auto-reassociation. Otherwise esp_wifi_scan_start()
@@ -378,9 +391,7 @@ void ESP32WiFiPortal::startAccessPoint() {
     Serial.print("[ESP32WiFiPortal] AP IP ");
     Serial.println(WiFi.softAPIP());
 
-    _dns.stop();
-    _dns.setErrorReplyCode(DNSReplyCode::NoError);
-    _dns.start(53, "*", WiFi.softAPIP());
+    _dns.setMode(DnsService::Mode::CaptivePortal, WiFi.softAPIP());
 
     // RFC 7710 / DHCP option 114: tell modern clients (iOS 14+, Android 11+,
     // macOS 11+) directly via DHCP that this is a captive portal and where
@@ -431,31 +442,16 @@ IPAddress ESP32WiFiPortal::pickRepeaterSubnet() const {
     return IPAddress(192, 168, 244, 1);
 }
 
-void ESP32WiFiPortal::refreshRepeaterDhcpDns() {
-    // The AP's DHCP server caches whatever DNS we passed to softAPConfig
-    // at first setup. If the STA later (re)associates and learns a
-    // different upstream DNS — or, in the failure case from the field,
-    // the STA briefly landed on a different subnet during reconnect and
-    // we captured a DNS that no longer routes — clients keep getting
-    // the stale value until they rejoin. Pull the current STA-side DNS
-    // and re-stamp the AP's DHCP DNS option without restarting the AP.
-    IPAddress dns = WiFi.dnsIP(0);
-    if ((uint32_t)dns == 0) dns = IPAddress(8, 8, 4, 4);
-    esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (apNetif == nullptr) return;
-
-    esp_netif_dns_info_t info = {};
-    info.ip.type = ESP_IPADDR_TYPE_V4;
-    info.ip.u_addr.ip4.addr = static_cast<uint32_t>(dns);
-    esp_netif_dhcps_stop(apNetif);
-    esp_err_t err = esp_netif_set_dns_info(apNetif, ESP_NETIF_DNS_MAIN, &info);
-    esp_netif_dhcps_start(apNetif);
-    if (err != ESP_OK) {
-        Serial.printf("[ESP32WiFiPortal] DHCP DNS refresh failed: 0x%x\n", err);
-    } else {
-        Serial.printf("[ESP32WiFiPortal] DHCP DNS set to %s\n",
-                      dns.toString().c_str());
-    }
+void ESP32WiFiPortal::refreshRepeaterUpstream() {
+    // Repeater clients have DHCP DNS pointing at our own AP IP so they
+    // hit the local DnsService regardless of upstream churn. Here we
+    // just update the service's notion of where to proxy queries to
+    // — whatever DHCP last gave the STA, falling back to a public
+    // resolver if upstream didn't supply one. setMode with the same
+    // mode re-applies the upstream parameter without rebinding sockets.
+    IPAddress upstream = WiFi.dnsIP(0);
+    if ((uint32_t)upstream == 0) upstream = IPAddress(8, 8, 4, 4);
+    _dns.setMode(DnsService::Mode::Forwarder, _repeaterApIp, upstream);
 }
 
 void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
@@ -464,15 +460,16 @@ void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
     _repeaterApSsid = upstreamSsid + kRepeaterApSuffix;
     IPAddress mask(255, 255, 255, 0);
     IPAddress leaseStart(_repeaterApIp[0], _repeaterApIp[1], _repeaterApIp[2], 2);
-    // Hand clients whatever DNS upstream gave us. Without this the DHCP
-    // server advertises the AP IP itself, which black-holes lookups because
-    // we don't run a resolver. Fall back to 8.8.4.4 if upstream didn't
-    // supply one (unlikely on a working STA association).
-    IPAddress dns = WiFi.dnsIP(0);
-    if ((uint32_t)dns == 0) dns = IPAddress(8, 8, 4, 4);
+    // Hand the AP's own IP to clients as DNS. They send queries to us,
+    // and the DnsForwarder below proxies them to whatever upstream the
+    // STA currently has. This decouples client DNS from upstream-DNS
+    // churn — no DHCP renew needed when upstream changes resolver.
+    IPAddress upstreamDns = WiFi.dnsIP(0);
+    if ((uint32_t)upstreamDns == 0) upstreamDns = IPAddress(8, 8, 4, 4);
 
     WiFi.mode(WIFI_AP_STA);
-    if (!WiFi.softAPConfig(_repeaterApIp, _repeaterApIp, mask, leaseStart, dns)) {
+    if (!WiFi.softAPConfig(_repeaterApIp, _repeaterApIp, mask, leaseStart,
+                           _repeaterApIp)) {
         Serial.println("[ESP32WiFiPortal] softAPConfig failed; aborting repeater");
         return;
     }
@@ -487,6 +484,8 @@ void ESP32WiFiPortal::startRepeaterAccessPoint(const String& upstreamSsid,
     Serial.printf("[ESP32WiFiPortal] Repeater AP \"%s\" on %s\n",
                   _repeaterApSsid.c_str(),
                   _repeaterApIp.toString().c_str());
+
+    _dns.setMode(DnsService::Mode::Forwarder, _repeaterApIp, upstreamDns);
 
     // Set the mode *before* enabling NAPT so the AP_START event handler
     // (which fires asynchronously after softAP() returns, once the new
