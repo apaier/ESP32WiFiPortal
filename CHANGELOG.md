@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-10-16
 
 - Replaced the Arduino-ESP32 `DNSServer` instance with an in-library `DnsService` (`src/DnsService.{h,cpp}`) that owns port 53 for the device's lifetime and dispatches by mode: `Off`, `CaptivePortal` (lie with the AP IP — drives iOS/Android/macOS captive-network detection), or `Forwarder` (proxy to upstream, match responses by DNS transaction ID). The reason for the rewrite is a real bug seen in the field: `DNSServer::stop()` on current pioarduino builds doesn't synchronously release its lwIP socket, so any subsequent component trying to bind port 53 — even on a specific local IP — got `EADDRINUSE`. Holding port 53 once at `ESP32WiFiPortal::begin()` and never rebinding sidesteps the timing problem.
 - Repeater clients now get the device's own AP IP as DNS (advertised via DHCP) instead of upstream's resolver. Queries land on `DnsService` in Forwarder mode, which proxies to whichever upstream the STA last learned from DHCP and is retargeted invisibly on every `STA_GOT_IP` — surviving upstream-DNS changes without forcing clients to rejoin or wait for DHCP lease renewal. See [docs/wifi-recovery.md](docs/wifi-recovery.md).
