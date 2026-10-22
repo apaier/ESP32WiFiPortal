@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- mDNS and configurable hostname. The device announces itself as `<hostname>.local` with an `_http._tcp` service and uses the same name for DHCP. The default is a sanitized copy of the AP name (`ESP32-Portal-Setup` → `esp32-portal-setup`); `setHostname()` overrides it from the sketch, and the config form's new **Device name** field saves an override to NVS under the `hostname` key. Added `getHostname()` and the `***hostname***` substitution token; custom `setHtml()` pages without a `hostname` field leave the saved name alone.
+- Redesigned `data/WiFiSetup.html`: card layout sized for phones (48px+ touch targets), automatic light/dark theme, status card with a colored indicator for AP / connected / repeater, signal shown as Strong / Good / Weak, rescan button, password hidden by default with a Show toggle, mode as tappable cards, and a "Connecting…" state on submit. System fonts and inline CSS/JS only, so it still works on an offline captive portal. Form fields and the `***…***` substitution tokens are unchanged, so no firmware changes are needed; custom `setHtml()` pages are unaffected. The network select now requires a choice instead of submitting the placeholder option. Embedded size grows from ~1.5 KB to ~6.8 KB.
+- Repeater AP SSID suffix shortened from `-extender` to `-ext` (`<upstream>-ext`), leaving room for upstream SSIDs up to 28 bytes within the 32-byte SSID limit. Devices already set up as repeaters will broadcast the new name after updating, so clients need to rejoin.
+
 ## 0.3.0 - 2026-10-16
 
 - Replaced the Arduino-ESP32 `DNSServer` instance with an in-library `DnsService` (`src/DnsService.{h,cpp}`) that owns port 53 for the device's lifetime and dispatches by mode: `Off`, `CaptivePortal` (lie with the AP IP — drives iOS/Android/macOS captive-network detection), or `Forwarder` (proxy to upstream, match responses by DNS transaction ID). The reason for the rewrite is a real bug seen in the field: `DNSServer::stop()` on current pioarduino builds doesn't synchronously release its lwIP socket, so any subsequent component trying to bind port 53 — even on a specific local IP — got `EADDRINUSE`. Holding port 53 once at `ESP32WiFiPortal::begin()` and never rebinding sidesteps the timing problem.

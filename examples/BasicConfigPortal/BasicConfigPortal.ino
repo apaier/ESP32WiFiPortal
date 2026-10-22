@@ -8,6 +8,9 @@
   automatically. If the saved network is unreachable it falls back to AP
   mode again.
 
+  Once joined, the device is also reachable at http://esp32-portal.local/
+  (mDNS). The name can be changed from the config form's Device name field.
+
   No filesystem upload step is required: the config-form HTML is
   compiled into the firmware from the library's data/ directory.
 */
@@ -19,6 +22,7 @@ ESP32WiFiPortal portal;
 void setup() {
     Serial.begin(115200);
     delay(200);
+    portal.setHostname("esp32-portal");
     portal.begin("ESP32-Portal-Setup");
 }
 

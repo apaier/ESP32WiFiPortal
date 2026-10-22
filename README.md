@@ -14,11 +14,19 @@ The config-form HTML lives in the library's `data/` directory and is compiled in
 
 Credentials are stored in NVS rather than on a user-visible filesystem, but **NVS itself is not encrypted by default** — bits on flash are still readable by anyone with a flash dump. See [docs/secure-credentials.md](docs/secure-credentials.md) for the threat model and the consumer-side opt-in for real encryption.
 
+### Hostname and mDNS
+
+The device announces itself over mDNS as `<hostname>.local` (with an `_http._tcp` service record) and sends the same name to the DHCP server, so once it has joined a network you can reach the config form at `http://<hostname>.local/` without looking up its IP.
+
+- The default hostname is the AP name passed to `begin()`, lowercased and reduced to letters, digits and hyphens (`ESP32-Portal-Setup` → `esp32-portal-setup`). Call `setHostname()` before `begin()` to choose a different default.
+- The config form has a **Device name** field. A name entered there is saved to NVS (key `hostname`) and overrides the sketch default; clearing the field reverts to the default.
+- Names are capped at 31 characters.
+
 ### Repeater mode
 
 The config form has a Client / Repeater radio button. When Repeater is chosen and the upstream join succeeds, the device also brings up its own AP and NAT-forwards traffic from clients of that AP to the upstream network.
 
-- AP SSID defaults to `<upstream-SSID>-extender`.
+- AP SSID defaults to `<upstream-SSID>-ext`.
 - AP password is the same as the upstream password (or open, if upstream is open).
 - AP subnet is picked at boot to avoid overlap with the upstream (candidates: `192.168.244.0/24`, `10.244.0.0/24`, `172.31.244.0/24`).
 - The captive-portal DNS / redirect / DHCP option 114 only run in the standalone config-AP fallback, never in Repeater mode.
@@ -120,6 +128,8 @@ WebServer&     server();
 void           on(const char* uri, WebServer::THandlerFunction handler);
 
 void setLedPin(int pin);                          // optional connection indicator
+void setHostname(const String& hostname);         // DHCP / mDNS name (<name>.local)
+String getHostname() const;
 void setHtml(const uint8_t* html, size_t length); // override the compiled-in form
 ```
 
@@ -127,13 +137,14 @@ void setHtml(const uint8_t* html, size_t length); // override the compiled-in fo
 
 `data/WiFiSetup.html` is the source of truth for the config form. Edit it like any other file in the repository, then rebuild — PlatformIO regenerates `src/generated/` automatically; Arduino IDE users run `python3 tools/embed_assets.py` first. See [docs/embedded-assets.md](docs/embedded-assets.md) for details on the `data/` → PROGMEM pipeline and on dropping additional assets in.
 
-The library substitutes four placeholders at request time:
+The library substitutes five placeholders at request time:
 
 - `***options***` — `<option>` tags for each scanned network.
 - `***Connection Status***` — current connection state.
 - `***client_checked***` / `***repeater_checked***` — `checked` injected into whichever mode radio is currently saved.
+- `***hostname***` — the current device hostname (without `.local`).
 
-You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present.
+You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present. The `hostname` field is optional; if a form omits it, the saved hostname is left unchanged.
 
 If you'd rather not touch `data/` at all, call `portal.setHtml(myHtmlBytes, myHtmlLen)` before `begin()` to override the compiled-in copy at runtime. The pointer must remain valid for the lifetime of the portal.
 

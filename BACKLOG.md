@@ -16,8 +16,8 @@ Scan-and-pounce in AP mode: every `kScanCadenceMs` (30s) we run an async scan fo
 ### 4. Configurable AP credentials via UI
 Today the AP is open and its name is whatever the sketch passes to `begin()`. Add fields for AP name + password and persist them.
 
-### 6. mDNS / configurable hostname
-Optional `setHostname()` and mDNS announcement so the device is reachable as `mydevice.local` on the network. Also covers the discoverability gap from #1 — once connected, users need a stable name to reach the config form without hunting through the router's DHCP table.
+### 6. mDNS / configurable hostname — done
+`setHostname()` sets the default (falls back to the sanitized AP name), the config form's Device name field persists an override to NVS, and `ESPmDNS` announces `<hostname>.local` plus an `_http._tcp` service. Original note: optional `setHostname()` and mDNS announcement so the device is reachable as `mydevice.local` on the network. Also covers the discoverability gap from #1 — once connected, users need a stable name to reach the config form without hunting through the router's DHCP table.
 
 ### 7. Move sensitive data to a secure storage approach — done
 Credentials moved out of LittleFS plaintext (`/wifi.json`) into NVS via the Arduino `Preferences` API, under the namespace `wifi_portal`. NVS storage on its own is not encrypted — the move is a stepping stone that lets consumers opt into NVS / flash encryption project-side without code changes. The threat model and the encryption opt-in path are documented in [docs/secure-credentials.md](docs/secure-credentials.md). The follow-up "make encryption turn-key" work is tracked as #13.
@@ -34,7 +34,7 @@ Repeater AP clients now get the device's own AP IP as DNS via DHCP, and a single
 ## Library / packaging
 
 ### 8. WiFiRepeater example — done (0.2.0)
-Implemented in-library rather than as a separate example: the config form has a Client / Repeater radio button, and selecting Repeater brings up an AP on a non-overlapping `/24` (SSID `<upstream>-extender`, same password as upstream) with NAPT forwarding via `WiFi.AP.enableNAPT`. STA disconnect/reconnect toggles NAPT through a `Network.onEvent` handler.
+Implemented in-library rather than as a separate example: the config form has a Client / Repeater radio button, and selecting Repeater brings up an AP on a non-overlapping `/24` (SSID `<upstream>-ext`, same password as upstream) with NAPT forwarding via `WiFi.AP.enableNAPT`. STA disconnect/reconnect toggles NAPT through a `Network.onEvent` handler.
 
 ### 9. Arduino Library Manager submission
 Once the API has settled, submit to the Arduino IDE Library Manager index so users can install via the IDE's library browser.

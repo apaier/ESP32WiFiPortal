@@ -60,6 +60,13 @@ public:
     // Optional configuration. Call before begin().
     void setLedPin(int pin);                          // -1 disables (default)
 
+    // Hostname used for DHCP and the mDNS announcement (<name>.local).
+    // Defaults to a sanitized copy of the AP name passed to begin(). A
+    // name saved from the config form overrides this default. Names are
+    // lowercased and reduced to [a-z0-9-], max 31 characters.
+    void setHostname(const String& hostname);
+    String getHostname() const;
+
     // Override the config-form HTML at runtime. Defaults to the build-time
     // embedded copy of data/WiFiSetup.html. The pointer must remain valid
     // for the lifetime of the portal; the bytes are not copied.
@@ -67,6 +74,7 @@ public:
 
 private:
     WebServer _server;
+    uint16_t _port;
     DnsService _dns;
     Preferences _prefs;
     int _ledPin;
@@ -75,6 +83,9 @@ private:
     bool _pagesRegistered;
     String _apName;
     String _apPassword;
+    String _defaultHostname;
+    String _hostname;
+    bool _mdnsStarted;
     const uint8_t* _htmlOverride;
     size_t _htmlOverrideLen;
     String _repeaterApSsid;
@@ -108,6 +119,9 @@ private:
     void startRepeaterAccessPoint(const String& upstreamSsid,
                                   const String& upstreamPassword);
     IPAddress pickRepeaterSubnet() const;
+    String loadSavedHostname();
+    void applyHostname(const String& hostname);
+    void startMdns();
     bool tryConnect(const String& network, const String& password,
                     const String& mode);
     void persistCredentials(const String& network, const String& password,

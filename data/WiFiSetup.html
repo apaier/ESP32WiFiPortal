@@ -3,24 +3,91 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WiFi Setup</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Arial,sans-serif;padding:.5rem;text-align:center}form{display:flex;flex-direction:column;gap:.5rem;align-items:center;width:100%;max-width:300px;margin:0 auto}h1{font-size:1.5rem;margin:.5rem 0}p{font-size:.9rem;margin:.3rem 0}label{display:block;font-weight:500;margin-top:.3rem;text-align:left}select,input[type=text],input[type=password]{width:100%;padding:.5rem;font-size:1rem;border:1px solid #ccc;border-radius:3px}.mode label{font-weight:normal;display:block;margin:.15rem 0}.mode input{width:auto;margin-right:.4rem}input[type=submit]{width:100%;padding:.5rem;font-size:1rem;background:#4CAF50;color:white;border:none;border-radius:3px;cursor:pointer;font-weight:bold;transition:background .3s}input[type=submit]:hover{background:#45a049}a{color:#4CAF50;text-decoration:none}@media(max-width:480px){h1{font-size:1.2rem}p{font-size:.85rem}select,input[type=text],input[type=password],input[type=submit]{padding:.4rem;font-size:.95rem}}</style>
+<style>
+:root{--bg:#eef1f6;--surface:#fff;--fg:#141a26;--muted:#5b6578;--line:#d6dce7;--field:#f6f8fb;--accent:#2457d6;--accent-fg:#fff;--accent-soft:#e3ebfc;--ok:#1d7a4a;--ok-soft:#dff3e8;--warn:#9a5b00;--warn-soft:#fbeed6}
+@media(prefers-color-scheme:dark){:root{--bg:#0e121a;--surface:#171d29;--fg:#e7ebf3;--muted:#9aa4b8;--line:#2a3344;--field:#11161f;--accent:#7ea2ff;--accent-fg:#0b1020;--accent-soft:#1d2a4a;--ok:#5fd39a;--ok-soft:#173527;--warn:#f0b357;--warn-soft:#3a2b12;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:420px;margin:0 auto;padding:20px 16px 28px;display:grid;gap:16px}
+header{display:flex;align-items:center;gap:12px}
+.logo{width:40px;height:40px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+h1{margin:0;font-size:1.25rem;line-height:1.2}
+header p{margin:0;font-size:.85rem;color:var(--muted)}
+.status{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:12px;background:var(--surface);border:1px solid var(--line);font-size:.875rem}
+.dot{width:10px;height:10px;border-radius:50%;flex:none;background:var(--warn);box-shadow:0 0 0 4px var(--warn-soft)}
+.ok .dot{background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
+.rep .dot{background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+#st{min-width:0;overflow-wrap:anywhere}
+#st small{display:block;color:var(--muted);font-size:.75rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+form{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px;display:grid;gap:14px}
+.field{display:grid;gap:6px}
+.field>label,.legend{font-size:.8rem;font-weight:600;color:var(--muted)}
+.row{display:flex;gap:8px}
+.ctl{width:100%;min-width:0;font:inherit;font-size:1rem;color:var(--fg);background:var(--field);border:1px solid var(--line);border-radius:10px;padding:12px;min-height:48px;-webkit-appearance:none;appearance:none}
+select.ctl{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 18px) 21px,calc(100% - 13px) 21px;background-size:5px 5px;background-repeat:no-repeat;padding-right:36px}
+.ctl:focus,.go:focus-visible,.icon:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.icon{flex:none;width:48px;min-height:48px;border-radius:10px;border:1px solid var(--line);background:var(--field);color:var(--muted);display:grid;place-items:center}
+.pw,.sfx{position:relative}
+.pw .ctl,.sfx .ctl{padding-right:64px}
+.sfx span{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none}
+.hint{margin:0;font-size:.75rem;color:var(--muted)}
+.pw button{position:absolute;right:6px;top:50%;transform:translateY(-50%);border:0;background:none;color:var(--accent);font:inherit;font-size:.8rem;font-weight:600;padding:8px;cursor:pointer}
+.modes{display:grid;gap:8px}
+.mode{display:flex;gap:12px;align-items:flex-start;padding:12px;border:1px solid var(--line);border-radius:12px;cursor:pointer;background:var(--field)}
+.mode input{accent-color:var(--accent);width:18px;height:18px;margin:2px 0 0;flex:none}
+.mode b{display:block;font-size:.95rem}
+.mode span{font-size:.8rem;color:var(--muted)}
+.mode:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+.go{width:100%;min-height:50px;border:0;border-radius:12px;background:var(--accent);color:var(--accent-fg);font:inherit;font-size:1rem;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px}
+.go:disabled{opacity:.75}
+.spin{width:16px;height:16px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:r .8s linear infinite}
+@keyframes r{to{transform:rotate(1turn)}}
+@media(prefers-reduced-motion:reduce){.spin{animation:none}}
+</style>
 </head>
 <body>
-<h1>WiFi Setup</h1>
-<p>Choose a network to connect this device to.</p>
-<p><a href=".">Reload</a></p>
-<p>***Connection Status***</p>
-<form action="wifi" method="get">
-<label for="network">Network:</label>
-<select name="network" id="network"><option>--Select Network--</option>***options***</select>
-<label for="password">Password:</label>
-<input name="password" id="password" type="text" placeholder="WiFi password">
-<label>Mode:</label>
-<div class="mode">
-<label><input type="radio" name="mode" value="client" ***client_checked***>Client (this device only)</label>
-<label><input type="radio" name="mode" value="repeater" ***repeater_checked***>Repeater (share WiFi with other devices)</label>
+<main>
+<header>
+<div class="logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 8.8a15 15 0 0 1 20 0"/><path d="M5 12.5a10 10 0 0 1 14 0"/><path d="M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1" fill="currentColor"/></svg></div>
+<div><h1>WiFi Setup</h1><p>Connect this device to a network</p></div>
+</header>
+<div class="status" id="status"><i class="dot"></i><span id="st">***Connection Status***</span></div>
+<form action="wifi" method="get" id="f">
+<div class="field">
+<label for="network">Network</label>
+<div class="row">
+<select class="ctl" name="network" id="network" required><option value="">Choose a network&hellip;</option>***options***</select>
+<a class="icon" href="." aria-label="Scan again" title="Scan again"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></svg></a>
 </div>
-<input type="submit" value="Connect">
+</div>
+<div class="field">
+<label for="password">Password</label>
+<div class="pw"><input class="ctl" name="password" id="password" type="password" placeholder="Network password" autocomplete="current-password"><button type="button" id="show">Show</button></div>
+</div>
+<div class="field">
+<div class="legend">Mode</div>
+<div class="modes">
+<label class="mode"><input type="radio" name="mode" value="client" ***client_checked***><div><b>Client</b><span>Only this device joins the network</span></div></label>
+<label class="mode"><input type="radio" name="mode" value="repeater" ***repeater_checked***><div><b>Repeater</b><span>Share the connection over this device's own WiFi</span></div></label>
+</div>
+</div>
+<div class="field">
+<label for="hostname">Device name</label>
+<div class="sfx"><input class="ctl" name="hostname" id="hostname" value="***hostname***" maxlength="31" autocapitalize="none" autocorrect="off" spellcheck="false"><span>.local</span></div>
+<p class="hint">Letters, numbers and hyphens. Leave blank for the default.</p>
+</div>
+<button class="go" type="submit" id="go">Connect</button>
 </form>
+</main>
+<script>
+// Firmware sends plain status text and "<ssid> - <rssi>" options; dress them up client-side.
+var st=document.getElementById("st"),t=st.textContent,m=t.match(/^(.*?)(?: - | \()(IP .*|RSSI -?\d+)\)?$/);
+document.getElementById("status").className="status"+(/^Connected/.test(t)?" ok":/^Repeating/.test(t)?" rep":"");
+if(m){st.textContent=m[1];var s=document.createElement("small");s.textContent=m[2].replace(/^(RSSI -?\d+)$/,"$1 dBm");st.appendChild(s);}
+[].forEach.call(document.querySelectorAll("#network option"),function(o){var r=o.textContent.match(/^(.*) - (-?\d+)$/);if(r){var v=+r[2];o.textContent=r[1]+" · "+(v>=-60?"Strong":v>=-72?"Good":"Weak");}});
+var pw=document.getElementById("password");
+document.getElementById("show").onclick=function(){var h=pw.type=="password";pw.type=h?"text":"password";this.textContent=h?"Hide":"Show";};
+document.getElementById("f").onsubmit=function(){var b=document.getElementById("go");b.disabled=true;b.innerHTML='<i class="spin"></i>Connecting&hellip;';};
+</script>
 </body>
 </html>

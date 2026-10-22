@@ -1,5 +1,6 @@
 #include "ESP32WiFiPortal.h"
 
+#include <ESPmDNS.h>
 #include <WiFi.h>
 #include <esp_netif.h>
 
@@ -16,23 +17,47 @@ constexpr const char* kPrefsNamespace = "wifi_portal";
 constexpr const char* kPrefNetworkKey = "network";
 constexpr const char* kPrefPasswordKey = "password";
 constexpr const char* kPrefModeKey = "mode";
+constexpr const char* kPrefHostnameKey = "hostname";
 constexpr const char* kModeClient = "client";
 constexpr const char* kModeRepeater = "repeater";
-constexpr const char* kRepeaterApSuffix = "-extender";
+constexpr const char* kRepeaterApSuffix = "-ext";
 constexpr const char* kHtmlAssetName = "WiFiSetup.html";
+constexpr const char* kFallbackHostname = "esp32-portal";
+// Arduino-ESP32's default-hostname buffer is 32 bytes including the NUL.
+constexpr size_t kMaxHostnameLen = 31;
 
 uint32_t ipToU32(const IPAddress& ip) {
     return ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) |
            ((uint32_t)ip[2] << 8) | (uint32_t)ip[3];
 }
+
+// Reduce to a valid DNS label: lowercase [a-z0-9-], no leading or
+// trailing hyphen. Spaces, underscores and dots become hyphens; anything
+// else is dropped. May return an empty string.
+String sanitizeHostname(const String& name) {
+    String out;
+    for (size_t i = 0; i < name.length() && out.length() < kMaxHostnameLen; ++i) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+        if (c == ' ' || c == '_' || c == '.') c = '-';
+        bool valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        if (!valid) continue;
+        if (c == '-' && out.length() == 0) continue;
+        out += c;
+    }
+    while (out.endsWith("-")) out.remove(out.length() - 1);
+    return out;
+}
 }  // namespace
 
 ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
     : _server(port),
+      _port(port),
       _ledPin(-1),
       _mode(WiFiPortalMode::AccessPoint),
       _prefsReady(false),
       _pagesRegistered(false),
+      _mdnsStarted(false),
       _htmlOverride(nullptr),
       _htmlOverrideLen(0),
       _scanInFlight(false),
@@ -54,6 +79,16 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
         return;
     }
 
+    if (_defaultHostname.length() == 0) {
+        _defaultHostname = sanitizeHostname(_apName);
+    }
+    if (_defaultHostname.length() == 0) _defaultHostname = kFallbackHostname;
+    String savedHostname = loadSavedHostname();
+    _hostname = savedHostname.length() > 0 ? savedHostname : _defaultHostname;
+    // Set before the first WiFi.mode() so the STA/AP netifs are created
+    // with this name and DHCP announces it.
+    WiFi.setHostname(_hostname.c_str());
+
     // DnsService binds port 53 lazily on the first setMode(non-Off)
     // call (from startAccessPoint or startRepeaterAccessPoint, both
     // of which run WiFi.mode() first and therefore have an
@@ -71,6 +106,7 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 
     registerPages();
     _server.begin();
+    startMdns();
 }
 
 void ESP32WiFiPortal::loop() {
@@ -119,6 +155,12 @@ void ESP32WiFiPortal::on(const char* uri, WebServer::THandlerFunction handler) {
 }
 
 void ESP32WiFiPortal::setLedPin(int pin) { _ledPin = pin; }
+
+void ESP32WiFiPortal::setHostname(const String& hostname) {
+    _defaultHostname = sanitizeHostname(hostname);
+}
+
+String ESP32WiFiPortal::getHostname() const { return _hostname; }
 
 void ESP32WiFiPortal::setHtml(const uint8_t* html, size_t length) {
     _htmlOverride = html;
@@ -247,6 +289,50 @@ void ESP32WiFiPortal::handleDisconnectEvent() {
 String ESP32WiFiPortal::loadSavedSsid() {
     if (!_prefsReady) return String();
     return _prefs.getString(kPrefNetworkKey, String());
+}
+
+String ESP32WiFiPortal::loadSavedHostname() {
+    if (!_prefsReady || !_prefs.isKey(kPrefHostnameKey)) return String();
+    return sanitizeHostname(_prefs.getString(kPrefHostnameKey, String()));
+}
+
+void ESP32WiFiPortal::applyHostname(const String& hostname) {
+    String clean = sanitizeHostname(hostname);
+    if (clean.length() == 0) clean = _defaultHostname;
+    // Only persist a genuine override, so a later change to the sketch's
+    // setHostname() default still takes effect on devices left at default.
+    if (_prefsReady) {
+        if (clean == _defaultHostname) {
+            _prefs.remove(kPrefHostnameKey);
+        } else {
+            _prefs.putString(kPrefHostnameKey, clean);
+        }
+    }
+    if (clean == _hostname) return;
+
+    _hostname = clean;
+    WiFi.setHostname(_hostname.c_str());
+    // The netifs already exist, so update them directly. The STA's DHCP
+    // client picks the new name up on its next lease request.
+    WiFi.STA.setHostname(_hostname.c_str());
+    WiFi.AP.setHostname(_hostname.c_str());
+    startMdns();
+}
+
+void ESP32WiFiPortal::startMdns() {
+    // The mDNS responder binds to the STA and AP netifs as they come and
+    // go, so one start covers every mode. Restart only on rename.
+    if (_mdnsStarted) {
+        MDNS.end();
+        _mdnsStarted = false;
+    }
+    if (!MDNS.begin(_hostname.c_str())) {
+        Serial.println("[ESP32WiFiPortal] mDNS start failed");
+        return;
+    }
+    MDNS.addService("http", "tcp", _port);
+    _mdnsStarted = true;
+    Serial.printf("[ESP32WiFiPortal] mDNS: http://%s.local/\n", _hostname.c_str());
 }
 
 void ESP32WiFiPortal::startScan() {
@@ -509,6 +595,10 @@ void ESP32WiFiPortal::persistCredentials(const String& network,
 
 void ESP32WiFiPortal::handleConfigPage() {
     if (_server.hasArg(kPrefNetworkKey)) {
+        // Apply before tryConnect so the new name goes out with DHCP.
+        if (_server.hasArg(kPrefHostnameKey)) {
+            applyHostname(_server.arg(kPrefHostnameKey));
+        }
         String submittedMode = _server.arg(kPrefModeKey);
         if (submittedMode != kModeRepeater) submittedMode = kModeClient;
         tryConnect(_server.arg(kPrefNetworkKey), _server.arg(kPrefPasswordKey),
@@ -555,6 +645,7 @@ void ESP32WiFiPortal::handleConfigPage() {
     html.replace("***Connection Status***", status);
     html.replace("***client_checked***", isRepeater ? "" : "checked");
     html.replace("***repeater_checked***", isRepeater ? "checked" : "");
+    html.replace("***hostname***", _hostname);
     _server.send(200, "text/html", html);
 }
 
