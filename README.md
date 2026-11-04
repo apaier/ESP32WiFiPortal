@@ -232,7 +232,7 @@ If you'd rather not touch `data/` at all, call `portal.setHtml(myHtmlBytes, myHt
 
 ## Roadmap
 
-See [BACKLOG.md](BACKLOG.md) for upcoming features. These will move to GitHub Issues once the repo is published.
+Planned features and known gaps are tracked in [GitHub Issues](https://github.com/apaier/ESP32WiFiPortal/issues).
 
 ## License
 

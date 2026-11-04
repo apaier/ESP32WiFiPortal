@@ -55,7 +55,7 @@ Nothing different. Once your project enables flash or NVS encryption at the part
 
 ## What might come next
 
-Tracked as backlog item #13: a turn-key path from the library side — boot-time detection of whether encryption is actually active, a clear log warning if it isn't, and recommended `partitions.csv` / `sdkconfig.defaults` snippets so the consumer doesn't have to reverse-engineer the docs. The fuse burning still has to be the consumer's decision, but the runtime "are we encrypted right now?" answer should be visible.
+Tracked as [issue #6](https://github.com/apaier/ESP32WiFiPortal/issues/6): a turn-key path from the library side — boot-time detection of whether encryption is actually active, a clear log warning if it isn't, and recommended `partitions.csv` / `sdkconfig.defaults` snippets so the consumer doesn't have to reverse-engineer the docs. The fuse burning still has to be the consumer's decision, but the runtime "are we encrypted right now?" answer should be visible.
 
 ## Files
 
