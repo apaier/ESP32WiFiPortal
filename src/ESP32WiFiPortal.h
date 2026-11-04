@@ -30,6 +30,8 @@
 #include <Preferences.h>
 #include <WebServer.h>
 
+#include "BatteryMonitor.h"
+#include "BootLog.h"
 #include "DnsService.h"
 
 enum class WiFiPortalMode { AccessPoint, Connected, Repeating };
@@ -58,7 +60,12 @@ public:
     void on(const char* uri, WebServer::THandlerFunction handler);
 
     // Optional configuration. Call before begin().
-    void setLedPin(int pin);                          // -1 disables (default)
+    // Status LED, -1 disables (default). Solid when online with working
+    // internet, fast blink when connecting or joined without internet,
+    // slow blink in AP (config portal) mode. Internet is checked by a
+    // background task fetching an HTTP 204 endpoint every 30 s (5 s
+    // while it's failing); the check only runs when an LED is set.
+    void setLedPin(int pin, bool activeLow = false);
 
     // Hostname used for DHCP and the mDNS announcement (<name>.local).
     // Defaults to a sanitized copy of the AP name passed to begin(). A
@@ -66,6 +73,28 @@ public:
     // lowercased and reduced to [a-z0-9-], max 31 characters.
     void setHostname(const String& hostname);
     String getHostname() const;
+
+    // Accept firmware over the network (ArduinoOTA on UDP/TCP 3232),
+    // advertised over mDNS as <hostname>.local. An empty password leaves
+    // OTA disabled; the library refuses to run OTA unauthenticated.
+    void enableOta(const String& password);
+
+    // Record each boot's reset reason and how far startup got in NVS,
+    // print the history at begin(), and serve it at /bootlog
+    // (/bootlog?clear=1 wipes it). For diagnosing resets that happen
+    // away from a serial monitor, e.g. brownouts on battery power.
+    void enableBootLog();
+
+#ifdef ESP32WIFIPORTAL_BATTERY
+    // Report supply-battery voltage and estimated charge on the status
+    // card and in /status.json. Only available when the build defines
+    // ESP32WIFIPORTAL_BATTERY; see BatteryMonitor.h for wiring. Both
+    // setters can be called before or after begin() and take effect
+    // immediately. A pin of -1 turns monitoring off.
+    void setBattery(const BatteryConfig& config);
+    void setBatteryPin(int pin);
+    BatteryConfig getBattery() const;
+#endif
 
     // Override the config-form HTML at runtime. Defaults to the build-time
     // embedded copy of data/WiFiSetup.html. The pointer must remain valid
@@ -76,8 +105,19 @@ private:
     WebServer _server;
     uint16_t _port;
     DnsService _dns;
+    BootLog _bootLog;
+#ifdef ESP32WIFIPORTAL_BATTERY
+    BatteryMonitor _battery;
+#endif
+    bool _bootLogEnabled;
     Preferences _prefs;
     int _ledPin;
+    bool _ledActiveLow;
+    bool _ledOn;
+    // Written by the probe task / event handler, read by loop().
+    volatile bool _internetOk;
+    volatile bool _connecting;
+    TaskHandle_t _probeTask;
     WiFiPortalMode _mode;
     bool _prefsReady;
     bool _pagesRegistered;
@@ -86,6 +126,8 @@ private:
     String _defaultHostname;
     String _hostname;
     bool _mdnsStarted;
+    String _otaPassword;
+    bool _otaStarted;
     const uint8_t* _htmlOverride;
     size_t _htmlOverrideLen;
     String _repeaterApSsid;
@@ -122,12 +164,21 @@ private:
     String loadSavedHostname();
     void applyHostname(const String& hostname);
     void startMdns();
+    void startOta();
+    void updateLed();
+    void startInternetProbe();
+    static void probeTaskEntry(void* self);
+    void runProbeLoop();
+    bool probeInternet();
     bool tryConnect(const String& network, const String& password,
                     const String& mode);
     void persistCredentials(const String& network, const String& password,
                             const String& mode);
     void handleConfigPage();
     void handleCaptiveRedirect();
+    void handleBootLog();
+    void handleStatusJson();
+    String batteryStatusText() const;
     void registerPages();
 };
 

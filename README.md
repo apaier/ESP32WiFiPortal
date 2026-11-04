@@ -22,6 +22,70 @@ The device announces itself over mDNS as `<hostname>.local` (with an `_http._tcp
 - The config form has a **Device name** field. A name entered there is saved to NVS (key `hostname`) and overrides the sketch default; clearing the field reverts to the default.
 - Names are capped at 31 characters.
 
+### OTA updates
+
+Call `enableOta(password)` before `begin()` to accept firmware over WiFi via ArduinoOTA (port 3232), advertised over mDNS as `<hostname>.local`. OTA always requires a password; an empty one leaves it disabled. While an upload runs, the portal stops serving pages, and the device reboots into the new firmware when it finishes.
+
+In this repo's PlatformIO setup the password lives in a git-ignored `secrets.ini`:
+
+1. `cp secrets.ini.example secrets.ini` and set `ota_password` (letters, digits, `-` and `_`). Set `ota_host` if you changed the hostname.
+2. Flash once over USB so the board runs an OTA-enabled build: `pio run -e esp32dev -t upload`.
+3. From then on, flash over WiFi: `pio run -e esp32dev_ota -t upload`.
+
+Without `secrets.ini` the project still builds, with OTA disabled. The password is compiled into the firmware, so anyone with the binary or a flash dump can recover it.
+
+### Status LED
+
+`setLedPin(pin)` drives an LED (pass `activeLow = true` for LEDs wired to light on LOW):
+
+| LED | Meaning |
+|---|---|
+| Solid | Joined the saved network (client or repeater) and the internet is reachable |
+| Fast blink | Connecting, or joined but the internet isn't reachable |
+| Slow blink | Running as the setup access point |
+
+Internet reachability is checked by a background task that fetches `http://connectivitycheck.gstatic.com/generate_204` (the endpoint Android uses) every 30 s, or every 5 s while it's failing, and immediately after the device gets an IP. The check only runs when an LED pin is set. Some DevKit boards have a blue LED on GPIO2; the ESP32-DevKitC has none, so the example drives an external LED on GPIO23 (GPIO23 → 220–330 Ω resistor → LED → GND).
+
+### Status JSON
+
+`GET /status.json` returns a snapshot of the device:
+
+```json
+{"hostname":"esp32-portal","mode":"repeater","uptime_s":86412,"ip":"192.168.1.42",
+ "ssid":"HomeNet","rssi":-58,"internet":true,"ap_ssid":"HomeNet-ext","ap_clients":2,
+ "battery":{"volts":15.82,"percent":72,"cells":4}}
+```
+
+`mode` is `ap`, `client` or `repeater`. `ssid` / `rssi` are `null` when not joined to a network, `ap_ssid` / `ap_clients` are `null` when no AP is running, and `internet` is `null` unless the status LED (and so the internet probe) is enabled. `battery` is present only in builds with battery monitoring, and is `null` if it isn't configured.
+
+### Battery monitoring (optional, compile-time)
+
+For boards running from a battery through a DC-DC converter, the library can report the battery's voltage and estimated charge on the setup page's status card and in `/status.json`. It is compiled in only when the build defines `ESP32WIFIPORTAL_BATTERY`:
+
+```ini
+build_flags = -DESP32WIFIPORTAL_BATTERY
+```
+
+Wiring: a divider from battery + to an ADC1 pin (GPIO32–39; ADC2 doesn't work while WiFi is on), with battery − sharing ground with the ESP32. For a battery up to ~20 V, 100 kΩ (top) and 15 kΩ (to ground) keep the pin under 2.6 V. Add 0.1 µF from the pin to ground. Check that your DC-DC converter isn't isolated — if battery − and board GND aren't connected, the reading won't work.
+
+```cpp
+BatteryConfig battery;
+battery.pin = 34;
+battery.dividerRatio = (100.0f + 15.0f) / 15.0f;  // (R1 + R2) / R2
+battery.cells = 4;                                // in series
+battery.curve = kBatteryCurveLiIon;               // or kBatteryCurveLiFePO4, kBatteryCurveLeadAcid
+battery.calibration = 1.0f;                       // multimeter volts / reported volts
+portal.setBattery(battery);
+```
+
+`setBattery()` and `setBatteryPin()` can be called before or after `begin()` and take effect immediately, so the pin can be changed at runtime; `setBatteryPin(-1)` turns monitoring off. Pins that aren't on ADC1 are rejected with a serial message and monitoring stays off.
+
+Chemistry and cell count are configuration, not code: pick a built-in curve or pass your own `BatteryCurve` (an array of `{cellVolts, percent}` points, highest voltage first). Percent is estimated from resting voltage per cell, so it reads low under heavy load and high while charging. Expect about ±1–2% voltage accuracy after setting `calibration` against a multimeter. Low battery is reported only; the library takes no action.
+
+### Boot log
+
+`enableBootLog()` keeps the last 8 boots in NVS (namespace `wp_bootlog`): the reset reason that started each boot and how far startup got (`booted` → `radio starting` → `network up` → `stable` after 60 s). The history is printed over serial at `begin()` and served as plain text at `/bootlog`; `/bootlog?clear=1` wipes it. Use it to diagnose resets that happen away from a serial monitor: run the board on its real power supply, then reconnect over USB and read the history. Repeated `BROWNOUT` entries stuck at `radio starting` mean the supply sags when WiFi transmits.
+
 ### Repeater mode
 
 The config form has a Client / Repeater radio button. When Repeater is chosen and the upstream join succeeds, the device also brings up its own AP and NAT-forwards traffic from clients of that AP to the upstream network.
@@ -111,6 +175,8 @@ void setup() {
 void loop() { portal.loop(); }
 ```
 
+The `BasicConfigPortal` example has a fuller one: a `/devices` page listing the devices connected to the board's own WiFi network.
+
 ## API
 
 ```cpp
@@ -127,9 +193,14 @@ IPAddress      getIP() const;
 WebServer&     server();
 void           on(const char* uri, WebServer::THandlerFunction handler);
 
-void setLedPin(int pin);                          // optional connection indicator
+void setLedPin(int pin, bool activeLow = false); // optional status LED (see below)
 void setHostname(const String& hostname);         // DHCP / mDNS name (<name>.local)
 String getHostname() const;
+void enableOta(const String& password);           // OTA updates; empty = disabled
+void enableBootLog();                             // reset history at boot + /bootlog
+void setBattery(const BatteryConfig& config);     // needs -DESP32WIFIPORTAL_BATTERY
+void setBatteryPin(int pin);                      //   change pin at runtime, -1 = off
+BatteryConfig getBattery() const;
 void setHtml(const uint8_t* html, size_t length); // override the compiled-in form
 ```
 
@@ -137,12 +208,13 @@ void setHtml(const uint8_t* html, size_t length); // override the compiled-in fo
 
 `data/WiFiSetup.html` is the source of truth for the config form. Edit it like any other file in the repository, then rebuild — PlatformIO regenerates `src/generated/` automatically; Arduino IDE users run `python3 tools/embed_assets.py` first. See [docs/embedded-assets.md](docs/embedded-assets.md) for details on the `data/` → PROGMEM pipeline and on dropping additional assets in.
 
-The library substitutes five placeholders at request time:
+The library substitutes six placeholders at request time:
 
 - `***options***` — `<option>` tags for each scanned network.
 - `***Connection Status***` — current connection state.
 - `***client_checked***` / `***repeater_checked***` — `checked` injected into whichever mode radio is currently saved.
 - `***hostname***` — the current device hostname (without `.local`).
+- `***battery***` — battery voltage and charge (e.g. `15.8 V · 72%`), or empty when battery monitoring is off.
 
 You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present. The `hostname` field is optional; if a form omits it, the saved hostname is left unchanged.
 

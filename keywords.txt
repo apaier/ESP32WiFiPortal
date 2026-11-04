@@ -24,6 +24,11 @@ setLedPin	KEYWORD2
 setHtml	KEYWORD2
 setHostname	KEYWORD2
 getHostname	KEYWORD2
+enableOta	KEYWORD2
+enableBootLog	KEYWORD2
+setBattery	KEYWORD2
+BatteryConfig	KEYWORD1
+BatteryCurve	KEYWORD1
 
 #######################################
 # Constants (LITERAL1)

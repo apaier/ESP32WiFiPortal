@@ -1,8 +1,10 @@
 #include "ESP32WiFiPortal.h"
 
+#include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <esp_netif.h>
+#include <esp_timer.h>
 
 #include "DnsService.h"
 #include "generated/embedded_assets.h"
@@ -23,8 +25,38 @@ constexpr const char* kModeRepeater = "repeater";
 constexpr const char* kRepeaterApSuffix = "-ext";
 constexpr const char* kHtmlAssetName = "WiFiSetup.html";
 constexpr const char* kFallbackHostname = "esp32-portal";
+constexpr uint16_t kOtaPort = 3232;
+constexpr uint32_t kLedSlowBlinkMs = 1000;
+constexpr uint32_t kLedFastBlinkMs = 125;
+// Same check Android uses: a plain-HTTP endpoint that returns 204 only
+// when the request really reached the internet (captive portals and
+// dead upstreams answer differently or not at all).
+constexpr const char* kProbeHost = "connectivitycheck.gstatic.com";
+constexpr const char* kProbePath = "/generate_204";
+constexpr uint32_t kProbeTimeoutMs = 3000;
+constexpr uint32_t kProbeOkIntervalMs = 30UL * 1000UL;
+constexpr uint32_t kProbeFailIntervalMs = 5UL * 1000UL;
 // Arduino-ESP32's default-hostname buffer is 32 bytes including the NUL.
 constexpr size_t kMaxHostnameLen = 31;
+
+String jsonString(const String& s) {
+    String out = "\"";
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if ((uint8_t)c < 0x20) {
+            char buf[7];
+            snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
+            out += buf;
+        } else {
+            out += c;
+        }
+    }
+    out += '"';
+    return out;
+}
 
 uint32_t ipToU32(const IPAddress& ip) {
     return ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) |
@@ -53,11 +85,18 @@ String sanitizeHostname(const String& name) {
 ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
     : _server(port),
       _port(port),
+      _bootLogEnabled(false),
       _ledPin(-1),
+      _ledActiveLow(false),
+      _ledOn(false),
+      _internetOk(false),
+      _connecting(false),
+      _probeTask(nullptr),
       _mode(WiFiPortalMode::AccessPoint),
       _prefsReady(false),
       _pagesRegistered(false),
       _mdnsStarted(false),
+      _otaStarted(false),
       _htmlOverride(nullptr),
       _htmlOverrideLen(0),
       _scanInFlight(false),
@@ -75,8 +114,19 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
     _apName = accessPointName;
     _apPassword = accessPointPassword;
 
+    // First, so a reset anywhere later in startup is still recorded.
+    if (_bootLogEnabled && _bootLog.begin()) {
+        Serial.print(_bootLog.format());
+    }
+
     if (!ensurePreferences()) {
         return;
+    }
+
+    if (_ledPin >= 0) {
+        pinMode(_ledPin, OUTPUT);
+        digitalWrite(_ledPin, _ledActiveLow ? HIGH : LOW);
+        startInternetProbe();
     }
 
     if (_defaultHostname.length() == 0) {
@@ -106,10 +156,14 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
 
     registerPages();
     _server.begin();
+    startOta();
     startMdns();
 }
 
 void ESP32WiFiPortal::loop() {
+    // Blocks for the duration of an upload, then reboots on success.
+    if (_otaStarted) ArduinoOTA.handle();
+    if (millis() >= BootLog::kStableAfterMs) _bootLog.mark(BootLog::Stage::Stable);
     _dns.loop();
 
     if (_scanInFlight) {
@@ -135,6 +189,7 @@ void ESP32WiFiPortal::loop() {
     }
 
     _server.handleClient();
+    updateLed();
 }
 
 WiFiPortalMode ESP32WiFiPortal::getMode() const { return _mode; }
@@ -154,13 +209,99 @@ void ESP32WiFiPortal::on(const char* uri, WebServer::THandlerFunction handler) {
     _server.on(uri, handler);
 }
 
-void ESP32WiFiPortal::setLedPin(int pin) { _ledPin = pin; }
+void ESP32WiFiPortal::setLedPin(int pin, bool activeLow) {
+    _ledPin = pin;
+    _ledActiveLow = activeLow;
+}
+
+void ESP32WiFiPortal::updateLed() {
+    if (_ledPin < 0) return;
+    // Blink phase is derived from millis() so no toggle state is needed.
+    uint32_t now = millis();
+    bool online = (_mode != WiFiPortalMode::AccessPoint) &&
+                  WiFi.status() == WL_CONNECTED && _internetOk;
+    bool on;
+    if (_connecting || (_mode != WiFiPortalMode::AccessPoint && !online)) {
+        on = (now / kLedFastBlinkMs) % 2 == 0;
+    } else if (_mode == WiFiPortalMode::AccessPoint) {
+        on = (now / kLedSlowBlinkMs) % 2 == 0;
+    } else {
+        on = true;
+    }
+    if (on == _ledOn) return;
+    _ledOn = on;
+    digitalWrite(_ledPin, (on != _ledActiveLow) ? HIGH : LOW);
+}
+
+void ESP32WiFiPortal::startInternetProbe() {
+    if (_probeTask != nullptr) return;
+    // A blocking DNS lookup + TCP connect would stall loop() (and the
+    // web server) for up to kProbeTimeoutMs, so it gets its own task.
+    xTaskCreate(&ESP32WiFiPortal::probeTaskEntry, "wp_probe", 4096, this, 1,
+                &_probeTask);
+}
+
+void ESP32WiFiPortal::probeTaskEntry(void* self) {
+    static_cast<ESP32WiFiPortal*>(self)->runProbeLoop();
+}
+
+void ESP32WiFiPortal::runProbeLoop() {
+    for (;;) {
+        bool ok = WiFi.status() == WL_CONNECTED && probeInternet();
+        if (ok != _internetOk) {
+            Serial.printf("[ESP32WiFiPortal] Internet %s\n",
+                          ok ? "reachable" : "unreachable");
+        }
+        _internetOk = ok;
+        // STA_GOT_IP notifies us to re-check straight away.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ok ? kProbeOkIntervalMs
+                                                  : kProbeFailIntervalMs));
+    }
+}
+
+bool ESP32WiFiPortal::probeInternet() {
+    NetworkClient client;
+    if (!client.connect(kProbeHost, 80, kProbeTimeoutMs)) return false;
+    client.setTimeout(kProbeTimeoutMs);
+    client.print(String("GET ") + kProbePath + " HTTP/1.1\r\nHost: " +
+                 kProbeHost + "\r\nConnection: close\r\n\r\n");
+    String statusLine = client.readStringUntil('\n');
+    client.stop();
+    // "HTTP/1.1 204 No Content"
+    return statusLine.startsWith("HTTP/") && statusLine.indexOf(" 204") > 0;
+}
 
 void ESP32WiFiPortal::setHostname(const String& hostname) {
     _defaultHostname = sanitizeHostname(hostname);
 }
 
 String ESP32WiFiPortal::getHostname() const { return _hostname; }
+
+void ESP32WiFiPortal::enableOta(const String& password) { _otaPassword = password; }
+
+void ESP32WiFiPortal::enableBootLog() { _bootLogEnabled = true; }
+
+#ifdef ESP32WIFIPORTAL_BATTERY
+void ESP32WiFiPortal::setBattery(const BatteryConfig& config) { _battery.begin(config); }
+
+void ESP32WiFiPortal::setBatteryPin(int pin) {
+    BatteryConfig config = _battery.config();
+    config.pin = pin;
+    _battery.begin(config);
+}
+
+BatteryConfig ESP32WiFiPortal::getBattery() const { return _battery.config(); }
+#endif
+
+String ESP32WiFiPortal::batteryStatusText() const {
+#ifdef ESP32WIFIPORTAL_BATTERY
+    if (_battery.active()) {
+        float volts = _battery.readVolts();
+        return String(volts, 1) + " V &middot; " + _battery.percentFor(volts) + "%";
+    }
+#endif
+    return String();
+}
 
 void ESP32WiFiPortal::setHtml(const uint8_t* html, size_t length) {
     _htmlOverride = html;
@@ -203,6 +344,7 @@ void ESP32WiFiPortal::registerWiFiEvents() {
     Network.onEvent([this](arduino_event_id_t event, arduino_event_info_t info) {
         switch (event) {
             case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+                _internetOk = false;
                 _disconnectReason = info.wifi_sta_disconnected.reason;
                 _disconnectEventPending = true;
                 if (_mode == WiFiPortalMode::Repeating) {
@@ -210,12 +352,14 @@ void ESP32WiFiPortal::registerWiFiEvents() {
                 }
                 break;
             case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+                _internetOk = false;
                 if (_mode == WiFiPortalMode::Repeating) {
                     WiFi.AP.enableNAPT(false);
                 }
                 break;
             case ARDUINO_EVENT_WIFI_STA_GOT_IP:
                 _softFailEventCount = 0;
+                if (_probeTask != nullptr) xTaskNotifyGive(_probeTask);
                 if (_mode == WiFiPortalMode::Repeating) {
                     // Force-reset NAPT: an enabled-but-stuck NAT table
                     // (e.g. left over from a reconnect where the STA
@@ -331,8 +475,32 @@ void ESP32WiFiPortal::startMdns() {
         return;
     }
     MDNS.addService("http", "tcp", _port);
+    if (_otaStarted) MDNS.enableArduino(kOtaPort, /*auth=*/true);
     _mdnsStarted = true;
     Serial.printf("[ESP32WiFiPortal] mDNS: http://%s.local/\n", _hostname.c_str());
+}
+
+void ESP32WiFiPortal::startOta() {
+    if (_otaStarted) return;
+    if (_otaPassword.length() == 0) {
+        Serial.println("[ESP32WiFiPortal] OTA disabled (no password set)");
+        return;
+    }
+    // ArduinoOTA's own mDNS handling would fight startMdns() on rename
+    // (its MDNS.begin/end aren't aware of ours), so we advertise the
+    // _arduino._tcp service ourselves.
+    ArduinoOTA.setMdnsEnabled(false);
+    ArduinoOTA.setPort(kOtaPort);
+    ArduinoOTA.setHostname(_hostname.c_str());
+    ArduinoOTA.setPassword(_otaPassword.c_str());
+    ArduinoOTA.onStart([]() { Serial.println("[ESP32WiFiPortal] OTA update started"); });
+    ArduinoOTA.onEnd([]() { Serial.println("[ESP32WiFiPortal] OTA update complete; rebooting"); });
+    ArduinoOTA.onError([](ota_error_t err) {
+        Serial.printf("[ESP32WiFiPortal] OTA error %u\n", (unsigned)err);
+    });
+    ArduinoOTA.begin();
+    _otaStarted = true;
+    Serial.printf("[ESP32WiFiPortal] OTA listening on port %u\n", kOtaPort);
 }
 
 void ESP32WiFiPortal::startScan() {
@@ -407,6 +575,7 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     // goes away; we'll re-arm whichever mode is appropriate once the
     // new state is established. The listener socket stays bound.
     _dns.setMode(DnsService::Mode::Off);
+    _bootLog.mark(BootLog::Stage::RadioStarting);
     // Re-arm chip-level auto-reconnect so transient drops after a
     // successful association recover on their own (we may have left it
     // off after a prior AP fallback).
@@ -416,12 +585,20 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     Serial.print("[ESP32WiFiPortal] Connecting to ");
     Serial.print(network);
 
-    uint32_t waited = 0;
-    while (WiFi.status() != WL_CONNECTED && waited < kConnectAttemptSeconds) {
-        Serial.print('.');
-        delay(1000);
-        waited++;
+    // Poll in short steps so the LED keeps blinking while we wait.
+    _connecting = true;
+    uint32_t started = millis();
+    uint32_t lastDot = started;
+    while (WiFi.status() != WL_CONNECTED &&
+           (millis() - started) < kConnectAttemptSeconds * 1000UL) {
+        if ((millis() - lastDot) >= 1000) {
+            Serial.print('.');
+            lastDot = millis();
+        }
+        updateLed();
+        delay(50);
     }
+    _connecting = false;
     Serial.println();
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -430,7 +607,7 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     }
 
     _mode = WiFiPortalMode::Connected;
-    if (_ledPin >= 0) digitalWrite(_ledPin, HIGH);
+    _bootLog.mark(BootLog::Stage::NetworkUp);
     Serial.print("[ESP32WiFiPortal] Connected, IP ");
     Serial.println(WiFi.localIP());
     persistCredentials(network, password, mode);
@@ -451,6 +628,7 @@ void ESP32WiFiPortal::startAccessPoint() {
     _lastBlindRetryMs = millis();
     _dns.setMode(DnsService::Mode::Off);
     Serial.println("[ESP32WiFiPortal] Starting Access Point");
+    _bootLog.mark(BootLog::Stage::RadioStarting);
 
     // Halt the chip's auto-reassociation. Otherwise esp_wifi_scan_start()
     // is rejected while the chip is mid-connect-attempt, and our periodic
@@ -476,6 +654,7 @@ void ESP32WiFiPortal::startAccessPoint() {
     }
     Serial.print("[ESP32WiFiPortal] AP IP ");
     Serial.println(WiFi.softAPIP());
+    _bootLog.mark(BootLog::Stage::NetworkUp);
 
     _dns.setMode(DnsService::Mode::CaptivePortal, WiFi.softAPIP());
 
@@ -646,6 +825,7 @@ void ESP32WiFiPortal::handleConfigPage() {
     html.replace("***client_checked***", isRepeater ? "" : "checked");
     html.replace("***repeater_checked***", isRepeater ? "checked" : "");
     html.replace("***hostname***", _hostname);
+    html.replace("***battery***", batteryStatusText());
     _server.send(200, "text/html", html);
 }
 
@@ -661,11 +841,54 @@ void ESP32WiFiPortal::handleCaptiveRedirect() {
     _server.send(404, "text/plain", "Not Found");
 }
 
+void ESP32WiFiPortal::handleBootLog() {
+    if (_server.hasArg("clear")) _bootLog.clear();
+    _server.send(200, "text/plain", _bootLog.format());
+}
+
+void ESP32WiFiPortal::handleStatusJson() {
+    bool staUp = (_mode != WiFiPortalMode::AccessPoint) &&
+                 WiFi.status() == WL_CONNECTED;
+    bool apUp = (_mode != WiFiPortalMode::Connected);
+    const char* mode = _mode == WiFiPortalMode::AccessPoint ? "ap"
+                       : _mode == WiFiPortalMode::Repeating ? "repeater"
+                                                            : "client";
+
+    String json = "{";
+    json += "\"hostname\":" + jsonString(_hostname);
+    json += ",\"mode\":\"" + String(mode) + "\"";
+    json += ",\"uptime_s\":" + String((uint32_t)(esp_timer_get_time() / 1000000LL));
+    json += ",\"ip\":" + jsonString(getIP().toString());
+    json += ",\"ssid\":" + (staUp ? jsonString(WiFi.SSID()) : String("null"));
+    json += ",\"rssi\":" + (staUp ? String(WiFi.RSSI()) : String("null"));
+    // Only known when the LED's internet probe is running.
+    json += ",\"internet\":" +
+            String(_probeTask == nullptr ? "null" : (_internetOk ? "true" : "false"));
+    json += ",\"ap_ssid\":" + (apUp ? jsonString(WiFi.softAPSSID()) : String("null"));
+    json += ",\"ap_clients\":" + (apUp ? String(WiFi.softAPgetStationNum()) : String("null"));
+#ifdef ESP32WIFIPORTAL_BATTERY
+    if (_battery.active()) {
+        float volts = _battery.readVolts();
+        json += ",\"battery\":{\"volts\":" + String(volts, 2) +
+                ",\"percent\":" + String(_battery.percentFor(volts)) +
+                ",\"cells\":" + String(_battery.cells()) + "}";
+    } else {
+        json += ",\"battery\":null";
+    }
+#endif
+    json += "}";
+    _server.send(200, "application/json", json);
+}
+
 void ESP32WiFiPortal::registerPages() {
     if (_pagesRegistered) return;
     auto handler = [this]() { this->handleConfigPage(); };
     _server.on("/", handler);
     _server.on("/wifi", handler);
+    _server.on("/status.json", [this]() { this->handleStatusJson(); });
+    if (_bootLogEnabled) {
+        _server.on("/bootlog", [this]() { this->handleBootLog(); });
+    }
     _server.onNotFound([this]() { this->handleCaptiveRedirect(); });
     _pagesRegistered = true;
 }
