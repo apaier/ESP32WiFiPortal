@@ -44,6 +44,24 @@ constexpr uint32_t kProbeFailIntervalMs = 5UL * 1000UL;
 // Arduino-ESP32's default-hostname buffer is 32 bytes including the NUL.
 constexpr size_t kMaxHostnameLen = 31;
 
+// SSIDs are arbitrary bytes from the air, so escape before putting them
+// in the page.
+String htmlEscape(const String& s) {
+    String out;
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&#39;"; break;
+            default: out += c;
+        }
+    }
+    return out;
+}
+
 String jsonString(const String& s) {
     String out = "\"";
     for (size_t i = 0; i < s.length(); ++i) {
@@ -310,36 +328,51 @@ void ESP32WiFiPortal::loadSavedBatteryCalibration() {
     _battery.setCalibration(_prefs.getFloat(kPrefBatteryCalKey, _batteryDefaultCalibration));
 }
 
-// POST /battery with measured=<multimeter volts> saves measured / raw as
-// the calibration; reset=1 drops it back to the sketch's value.
+// POST /api/battery/calibration with measured=<multimeter volts> saves
+// measured / raw as the calibration; reset=1 drops it back to the
+// sketch's value. The setup page's form sends from=page and gets a
+// redirect back to /; anything else (curl, scripts) gets JSON.
 void ESP32WiFiPortal::handleBatteryCalibration() {
-    if (_server.method() != HTTP_POST) {
-        _server.send(405, "text/plain", "Use POST");
-        return;
-    }
+    bool fromBrowser = _server.arg("from") == "page";
+    String error;
     if (_server.hasArg("reset")) {
         if (_prefsReady) _prefs.remove(kPrefBatteryCalKey);
         _battery.setCalibration(_batteryDefaultCalibration);
         Serial.printf("[ESP32WiFiPortal] Battery calibration reset to %.4f\n",
                       _batteryDefaultCalibration);
+    } else if (!_battery.active()) {
+        error = "Battery monitoring is not active.";
     } else {
         float measured = _server.arg("measured").toFloat();
-        float raw = _battery.active() ? _battery.readVolts() / _battery.config().calibration : 0.0f;
+        float raw = _battery.readVolts() / _battery.config().calibration;
         float factor = (raw > 0.5f) ? measured / raw : 0.0f;
         if (factor < kMinBatteryCalibration || factor > kMaxBatteryCalibration) {
-            _server.send(400, "text/html",
-                         "<p>Calibration not saved: the board reads " + String(raw, 2) +
-                             " V before calibration, so " + String(measured, 2) +
-                             " V would need a factor outside 0.5&ndash;1.5. Check the "
-                             "wiring and divider ratio.</p><p><a href=\"/\">Back</a></p>");
-            return;
+            error = "The board reads " + String(raw, 2) + " V before calibration, so " +
+                    String(measured, 2) +
+                    " V would need a factor outside 0.5-1.5. Check the wiring and "
+                    "divider ratio.";
+        } else {
+            if (_prefsReady) _prefs.putFloat(kPrefBatteryCalKey, factor);
+            _battery.setCalibration(factor);
+            Serial.printf("[ESP32WiFiPortal] Battery calibration set to %.4f\n", factor);
         }
-        if (_prefsReady) _prefs.putFloat(kPrefBatteryCalKey, factor);
-        _battery.setCalibration(factor);
-        Serial.printf("[ESP32WiFiPortal] Battery calibration set to %.4f\n", factor);
     }
-    _server.sendHeader("Location", "/", true);
-    _server.send(303, "text/plain", "");
+
+    if (fromBrowser) {
+        if (error.length() > 0) {
+            _server.send(400, "text/html",
+                         "<p>Calibration not saved. " + error +
+                             "</p><p><a href=\"/\">Back</a></p>");
+        } else {
+            _server.sendHeader("Location", "/", true);
+            _server.send(303, "text/plain", "");
+        }
+    } else if (error.length() > 0) {
+        _server.send(400, "application/json", "{\"error\":" + jsonString(error) + "}");
+    } else {
+        _server.send(200, "application/json",
+                     "{\"calibration\":" + String(_battery.config().calibration, 4) + "}");
+    }
 }
 #endif
 
@@ -631,6 +664,12 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     // off after a prior AP fallback).
     WiFi.setAutoReconnect(true);
     WiFi.mode(WIFI_STA);
+    // The default fast scan joins the first AP it finds with this SSID.
+    // Scanning every channel lets the driver pick the strongest one when
+    // several share the name (mesh nodes, extenders); it's stored in the
+    // STA config, so the chip's own reconnects do the same.
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
     WiFi.begin(network.c_str(), password.c_str());
     Serial.print("[ESP32WiFiPortal] Connecting to ");
     Serial.print(network);
@@ -830,20 +869,57 @@ void ESP32WiFiPortal::handleConfigPage() {
         }
         String submittedMode = _server.arg(kPrefModeKey);
         if (submittedMode != kModeRepeater) submittedMode = kModeClient;
-        tryConnect(_server.arg(kPrefNetworkKey), _server.arg(kPrefPasswordKey),
-                   submittedMode);
+        String network = _server.arg(kPrefNetworkKey);
+        String password = _server.arg(kPrefPasswordKey);
+        String savedNetwork = loadSavedSsid();
+        String savedPassword = _prefs.getString(kPrefPasswordKey, String());
+        String savedMode = _prefs.getString(kPrefModeKey, kModeClient);
+        if (savedMode != kModeRepeater) savedMode = kModeClient;
+        // A blank password on the saved network means "keep it", so the
+        // form can be used to rename without re-entering credentials.
+        if (network == savedNetwork && password.length() == 0) {
+            password = savedPassword;
+        }
+        // Nothing about the connection changed and it's up: don't drop
+        // WiFi just to rejoin the same network.
+        bool online = (_mode == WiFiPortalMode::Connected ||
+                       _mode == WiFiPortalMode::Repeating) &&
+                      WiFi.status() == WL_CONNECTED;
+        bool unchanged = network == savedNetwork && password == savedPassword &&
+                         submittedMode == savedMode;
+        if (!(online && unchanged)) {
+            tryConnect(network, password, submittedMode);
+        }
     }
 
+    // One entry per network name, showing its strongest AP; hidden
+    // networks have no name to pick, so they're left out. The saved
+    // network is pre-selected (and listed even when out of range) so the
+    // form can be resubmitted without picking it again.
+    String savedNetwork = loadSavedSsid();
+    bool savedListed = false;
     int networks = WiFi.scanNetworks();
     String options;
     for (int i = 0; i < networks; ++i) {
-        options += "<option value=\"";
-        options += WiFi.SSID(i);
-        options += "\">";
-        options += WiFi.SSID(i);
-        options += " - ";
-        options += WiFi.RSSI(i);
-        options += "</option>";
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) continue;
+        bool strongest = true;
+        for (int j = 0; j < networks && strongest; ++j) {
+            if (j == i || WiFi.SSID(j) != ssid) continue;
+            int32_t a = WiFi.RSSI(i), b = WiFi.RSSI(j);
+            if (b > a || (b == a && j < i)) strongest = false;
+        }
+        if (!strongest) continue;
+        String name = htmlEscape(ssid);
+        bool saved = ssid == savedNetwork;
+        savedListed = savedListed || saved;
+        options += "<option value=\"" + name + "\"" + (saved ? " selected data-saved" : "") +
+                   ">" + name + " - " + String(WiFi.RSSI(i)) + "</option>";
+    }
+    if (savedNetwork.length() > 0 && !savedListed) {
+        String name = htmlEscape(savedNetwork);
+        options = "<option value=\"" + name + "\" selected data-saved>" + name +
+                  " (not in range)</option>" + options;
     }
 
     const uint8_t* htmlBytes = _htmlOverride;
@@ -861,10 +937,10 @@ void ESP32WiFiPortal::handleConfigPage() {
 
     String status;
     if (_mode == WiFiPortalMode::Repeating) {
-        status = "Repeating " + WiFi.SSID() + " as \"" + _repeaterApSsid +
-                 "\" (RSSI " + WiFi.RSSI() + ")";
+        status = "Repeating " + htmlEscape(WiFi.SSID()) + " as &quot;" +
+                 htmlEscape(_repeaterApSsid) + "&quot; (RSSI " + WiFi.RSSI() + ")";
     } else if (WiFi.status() == WL_CONNECTED) {
-        status = "Connected to " + WiFi.SSID() + " (RSSI " + WiFi.RSSI() + ")";
+        status = "Connected to " + htmlEscape(WiFi.SSID()) + " (RSSI " + WiFi.RSSI() + ")";
     } else {
         status = "Access Point Mode - IP " + WiFi.softAPIP().toString();
     }
@@ -905,7 +981,6 @@ void ESP32WiFiPortal::handleCaptiveRedirect() {
 }
 
 void ESP32WiFiPortal::handleBootLog() {
-    if (_server.hasArg("clear")) _bootLog.clear();
     _server.send(200, "text/plain", _bootLog.format());
 }
 
@@ -949,12 +1024,18 @@ void ESP32WiFiPortal::registerPages() {
     auto handler = [this]() { this->handleConfigPage(); };
     _server.on("/", handler);
     _server.on("/wifi", handler);
-    _server.on("/status.json", [this]() { this->handleStatusJson(); });
+    _server.on("/api/status", HTTP_GET, [this]() { this->handleStatusJson(); });
     if (_bootLogEnabled) {
-        _server.on("/bootlog", [this]() { this->handleBootLog(); });
+        _server.on("/api/bootlog", HTTP_GET, [this]() { this->handleBootLog(); });
+        // POST so a prefetch or a reloaded bookmark can't wipe the log.
+        _server.on("/api/bootlog/clear", HTTP_POST, [this]() {
+            _bootLog.clear();
+            _server.send(200, "text/plain", _bootLog.format());
+        });
     }
 #ifdef ESP32WIFIPORTAL_BATTERY
-    _server.on("/battery", [this]() { this->handleBatteryCalibration(); });
+    _server.on("/api/battery/calibration", HTTP_POST,
+               [this]() { this->handleBatteryCalibration(); });
 #endif
     _server.onNotFound([this]() { this->handleCaptiveRedirect(); });
     _pagesRegistered = true;

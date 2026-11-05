@@ -46,9 +46,18 @@ Without `secrets.ini` the project still builds, with OTA disabled. The password 
 
 Internet reachability is checked by a background task that fetches `http://connectivitycheck.gstatic.com/generate_204` (the endpoint Android uses) every 30 s, or every 5 s while it's failing, and immediately after the device gets an IP. The check only runs when an LED pin is set. Some DevKit boards have a blue LED on GPIO2; the ESP32-DevKitC has none, so the example drives an external LED on GPIO23 (GPIO23 → 220–330 Ω resistor → LED → GND).
 
-### Status JSON
+### HTTP API
 
-`GET /status.json` returns a snapshot of the device:
+Machine-readable endpoints live under `/api/`; the setup page stays at `/`. Like the setup page, they have no authentication.
+
+| Route | Available | Purpose |
+|---|---|---|
+| `GET /api/status` | Always | Device snapshot as JSON (below) |
+| `GET /api/bootlog` | With `enableBootLog()` | Boot history as plain text |
+| `POST /api/bootlog/clear` | With `enableBootLog()` | Clear the boot history (keeps the current boot) |
+| `POST /api/battery/calibration` | With `-DESP32WIFIPORTAL_BATTERY` | `measured=<volts>` to calibrate, `reset=1` to go back to the sketch's value; returns `{"calibration":…}` or `{"error":…}` |
+
+`GET /api/status` returns:
 
 ```json
 {"hostname":"esp32-portal","mode":"repeater","uptime_s":86412,"ip":"192.168.1.42",
@@ -60,7 +69,7 @@ Internet reachability is checked by a background task that fetches `http://conne
 
 ### Battery monitoring (optional, compile-time)
 
-For boards running from a battery through a DC-DC converter, the library can report the battery's voltage and estimated charge on the setup page's status card and in `/status.json`. It is compiled in only when the build defines `ESP32WIFIPORTAL_BATTERY`:
+For boards running from a battery through a DC-DC converter, the library can report the battery's voltage and estimated charge on the setup page's status card and in `/api/status`. It is compiled in only when the build defines `ESP32WIFIPORTAL_BATTERY`:
 
 ```ini
 build_flags = -DESP32WIFIPORTAL_BATTERY
@@ -80,13 +89,13 @@ portal.setBattery(battery);
 
 `setBattery()` and `setBatteryPin()` can be called before or after `begin()` and take effect immediately, so the pin can be changed at runtime; `setBatteryPin(-1)` turns monitoring off. Pins that aren't on ADC1 are rejected with a serial message and monitoring stays off.
 
-To calibrate without reflashing, use the **Battery calibration** card on the setup page (shown only when monitoring is active). With the board running, measure the battery terminals with a multimeter, enter that reading, and press Calibrate; the board saves `measured ÷ uncalibrated reading` to NVS (key `bat_cal`), and that saved value overrides `battery.calibration` from the sketch until you press Reset. Factors outside 0.5–1.5 are rejected, since that points to a wiring or divider-ratio mistake rather than tolerance. The card posts to `/battery` (`measured=<volts>`, or `reset=1`), and the current factor is in `/status.json`. Labeled resistor values are fine for `dividerRatio`: calibration absorbs both resistor tolerance and ADC error.
+To calibrate without reflashing, use the **Battery calibration** card on the setup page (shown only when monitoring is active). With the board running, measure the battery terminals with a multimeter, enter that reading, and press Calibrate; the board saves `measured ÷ uncalibrated reading` to NVS (key `bat_cal`), and that saved value overrides `battery.calibration` from the sketch until you press Reset. Factors outside 0.5–1.5 are rejected, since that points to a wiring or divider-ratio mistake rather than tolerance. The same thing works from a script: `curl -X POST -d measured=15.90 http://<device>.local/api/battery/calibration`. The current factor is in `/api/status`. Labeled resistor values are fine for `dividerRatio`: calibration absorbs both resistor tolerance and ADC error.
 
 Chemistry and cell count are configuration, not code: pick a built-in curve or pass your own `BatteryCurve` (an array of `{cellVolts, percent}` points, highest voltage first). Percent is estimated from resting voltage per cell, so it reads low under heavy load and high while charging. Expect about ±1–2% voltage accuracy after setting `calibration` against a multimeter. Low battery is reported only; the library takes no action.
 
 ### Boot log
 
-`enableBootLog()` keeps the last 8 boots in NVS (namespace `wp_bootlog`): the reset reason that started each boot and how far startup got (`booted` → `radio starting` → `network up` → `stable` after 60 s). The history is printed over serial at `begin()` and served as plain text at `/bootlog`; `/bootlog?clear=1` wipes it. Use it to diagnose resets that happen away from a serial monitor: run the board on its real power supply, then reconnect over USB and read the history. Repeated `BROWNOUT` entries stuck at `radio starting` mean the supply sags when WiFi transmits.
+`enableBootLog()` keeps the last 8 boots in NVS (namespace `wp_bootlog`): the reset reason that started each boot and how far startup got (`booted` → `radio starting` → `network up` → `stable` after 60 s). The history is printed over serial at `begin()` and served as plain text at `/api/bootlog`; `curl -X POST http://<device>.local/api/bootlog/clear` wipes it. Use it to diagnose resets that happen away from a serial monitor: run the board on its real power supply, then reconnect over USB and read the history. Repeated `BROWNOUT` entries stuck at `radio starting` mean the supply sags when WiFi transmits.
 
 ### Repeater mode
 
@@ -199,7 +208,7 @@ void setLedPin(int pin, bool activeLow = false); // optional status LED (see bel
 void setHostname(const String& hostname);         // DHCP / mDNS name (<name>.local)
 String getHostname() const;
 void enableOta(const String& password);           // OTA updates; empty = disabled
-void enableBootLog();                             // reset history at boot + /bootlog
+void enableBootLog();                             // reset history at boot + /api/bootlog
 void setBattery(const BatteryConfig& config);     // needs -DESP32WIFIPORTAL_BATTERY
 void setBatteryPin(int pin);                      //   change pin at runtime, -1 = off
 BatteryConfig getBattery() const;
@@ -220,7 +229,7 @@ The library substitutes these placeholders at request time:
 - `***battery_hidden***` — `hidden` when battery monitoring is off, otherwise empty; put it on the calibration form's tag.
 - `***battery_volts***` / `***battery_calibration***` — current battery voltage (2 decimals) and calibration factor for the calibration card, or empty when monitoring is off.
 
-You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present. The `hostname` field is optional; if a form omits it, the saved hostname is left unchanged.
+You can replace the file with any markup you want as long as those placeholders and a form submitting `network`, `password`, and `mode` to `/wifi` are present (use `method="post"` so the password stays out of the URL). The `hostname` field is optional; if a form omits it, the saved hostname is left unchanged. A blank `password` with the saved `network` keeps the saved password, and a submission that changes nothing about the connection doesn't reconnect.
 
 If you'd rather not touch `data/` at all, call `portal.setHtml(myHtmlBytes, myHtmlLen)` before `begin()` to override the compiled-in copy at runtime. The pointer must remain valid for the lifetime of the portal.
 

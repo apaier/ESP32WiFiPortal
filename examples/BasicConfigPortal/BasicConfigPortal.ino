@@ -21,7 +21,7 @@
   also printed over serial. It shows how to add your own page with
   portal.on().
 
-  Status: http://<device>/status.json reports mode, uptime, RSSI and
+  Status: http://<device>/api/status reports mode, uptime, RSSI and
   (when built with -DESP32WIFIPORTAL_BATTERY) the supply battery.
 
   No filesystem upload step is required: the config-form HTML is

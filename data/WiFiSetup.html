@@ -60,7 +60,7 @@ select.ctl{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 5
 <div><h1>WiFi Setup</h1><p>Connect this device to a network</p></div>
 </header>
 <div class="status" id="status"><i class="dot"></i><span id="st">***Connection Status***</span><span class="bat" title="Battery">***battery***</span></div>
-<form action="wifi" method="get" id="f">
+<form action="wifi" method="post" id="f">
 <div class="field">
 <label for="network">Network</label>
 <div class="row">
@@ -86,7 +86,8 @@ select.ctl{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 5
 </div>
 <button class="go" type="submit" id="go">Connect</button>
 </form>
-<form action="battery" method="post" ***battery_hidden***>
+<form action="api/battery/calibration" method="post" ***battery_hidden***>
+<input type="hidden" name="from" value="page">
 <div class="legend">Battery calibration</div>
 <p class="reading">Board reads <b>***battery_volts*** V</b> &middot; factor ***battery_calibration***</p>
 <div class="field">
@@ -109,7 +110,10 @@ if(m){st.textContent=m[1];var s=document.createElement("small");s.textContent=m[
 // Battery arrives as "15.8 V &middot; 72%"; show the percent with a gauge.
 var bat=document.querySelector(".bat"),bm=bat.textContent.match(/^(.*) · (\d+)%$/);
 if(bm){var p=+bm[2];bat.innerHTML='<span class="cell'+(p<20?' low':'')+'"><i style="width:'+p+'%"></i></span>'+p+'% · '+bm[1];}
-var pw=document.getElementById("password");
+var pw=document.getElementById("password"),net=document.getElementById("network");
+// Blank password on the saved network keeps the saved one.
+function hint(){var o=net.options[net.selectedIndex];pw.placeholder=o&&o.hasAttribute("data-saved")?"Saved \u2014 leave blank to keep":"Network password";}
+net.onchange=hint;hint();
 document.getElementById("show").onclick=function(){var h=pw.type=="password";pw.type=h?"text":"password";this.textContent=h?"Hide":"Show";};
 document.getElementById("f").onsubmit=function(){var b=document.getElementById("go");b.disabled=true;b.innerHTML='<i class="spin"></i>Connecting&hellip;';};
 </script>

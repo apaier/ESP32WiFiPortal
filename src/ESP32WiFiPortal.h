@@ -80,14 +80,14 @@ public:
     void enableOta(const String& password);
 
     // Record each boot's reset reason and how far startup got in NVS,
-    // print the history at begin(), and serve it at /bootlog
-    // (/bootlog?clear=1 wipes it). For diagnosing resets that happen
+    // print the history at begin(), and serve it at /api/bootlog
+    // (POST /api/bootlog/clear wipes it). For diagnosing resets that happen
     // away from a serial monitor, e.g. brownouts on battery power.
     void enableBootLog();
 
 #ifdef ESP32WIFIPORTAL_BATTERY
     // Report supply-battery voltage and estimated charge on the status
-    // card and in /status.json. Only available when the build defines
+    // card and in /api/status. Only available when the build defines
     // ESP32WIFIPORTAL_BATTERY; see BatteryMonitor.h for wiring. Both
     // setters can be called before or after begin() and take effect
     // immediately. A pin of -1 turns monitoring off. A calibration saved
