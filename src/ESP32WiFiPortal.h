@@ -90,7 +90,9 @@ public:
     // card and in /status.json. Only available when the build defines
     // ESP32WIFIPORTAL_BATTERY; see BatteryMonitor.h for wiring. Both
     // setters can be called before or after begin() and take effect
-    // immediately. A pin of -1 turns monitoring off.
+    // immediately. A pin of -1 turns monitoring off. A calibration saved
+    // from the setup page (stored in NVS) overrides config.calibration
+    // until it is reset there.
     void setBattery(const BatteryConfig& config);
     void setBatteryPin(int pin);
     BatteryConfig getBattery() const;
@@ -108,6 +110,8 @@ private:
     BootLog _bootLog;
 #ifdef ESP32WIFIPORTAL_BATTERY
     BatteryMonitor _battery;
+    // The sketch's calibration, restored when the saved one is reset.
+    float _batteryDefaultCalibration = 1.0f;
 #endif
     bool _bootLogEnabled;
     Preferences _prefs;
@@ -179,6 +183,10 @@ private:
     void handleBootLog();
     void handleStatusJson();
     String batteryStatusText() const;
+#ifdef ESP32WIFIPORTAL_BATTERY
+    void loadSavedBatteryCalibration();
+    void handleBatteryCalibration();
+#endif
     void registerPages();
 };
 

@@ -58,6 +58,10 @@ bool BatteryMonitor::active() const { return _active; }
 
 const BatteryConfig& BatteryMonitor::config() const { return _config; }
 
+void BatteryMonitor::setCalibration(float calibration) {
+    if (calibration > 0.0f) _config.calibration = calibration;
+}
+
 float BatteryMonitor::readVolts() const {
     if (!_active) return 0.0f;
     // analogReadMilliVolts applies the chip's factory ADC calibration.

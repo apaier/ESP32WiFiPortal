@@ -53,7 +53,7 @@ Internet reachability is checked by a background task that fetches `http://conne
 ```json
 {"hostname":"esp32-portal","mode":"repeater","uptime_s":86412,"ip":"192.168.1.42",
  "ssid":"HomeNet","rssi":-58,"internet":true,"ap_ssid":"HomeNet-ext","ap_clients":2,
- "battery":{"volts":15.82,"percent":72,"cells":4}}
+ "battery":{"volts":15.82,"percent":72,"cells":4,"calibration":1.0180}}
 ```
 
 `mode` is `ap`, `client` or `repeater`. `ssid` / `rssi` are `null` when not joined to a network, `ap_ssid` / `ap_clients` are `null` when no AP is running, and `internet` is `null` unless the status LED (and so the internet probe) is enabled. `battery` is present only in builds with battery monitoring, and is `null` if it isn't configured.
@@ -79,6 +79,8 @@ portal.setBattery(battery);
 ```
 
 `setBattery()` and `setBatteryPin()` can be called before or after `begin()` and take effect immediately, so the pin can be changed at runtime; `setBatteryPin(-1)` turns monitoring off. Pins that aren't on ADC1 are rejected with a serial message and monitoring stays off.
+
+To calibrate without reflashing, use the **Battery calibration** card on the setup page (shown only when monitoring is active). With the board running, measure the battery terminals with a multimeter, enter that reading, and press Calibrate; the board saves `measured ÷ uncalibrated reading` to NVS (key `bat_cal`), and that saved value overrides `battery.calibration` from the sketch until you press Reset. Factors outside 0.5–1.5 are rejected, since that points to a wiring or divider-ratio mistake rather than tolerance. The card posts to `/battery` (`measured=<volts>`, or `reset=1`), and the current factor is in `/status.json`. Labeled resistor values are fine for `dividerRatio`: calibration absorbs both resistor tolerance and ADC error.
 
 Chemistry and cell count are configuration, not code: pick a built-in curve or pass your own `BatteryCurve` (an array of `{cellVolts, percent}` points, highest voltage first). Percent is estimated from resting voltage per cell, so it reads low under heavy load and high while charging. Expect about ±1–2% voltage accuracy after setting `calibration` against a multimeter. Low battery is reported only; the library takes no action.
 
@@ -208,13 +210,15 @@ void setHtml(const uint8_t* html, size_t length); // override the compiled-in fo
 
 `data/WiFiSetup.html` is the source of truth for the config form. Edit it like any other file in the repository, then rebuild — PlatformIO regenerates `src/generated/` automatically; Arduino IDE users run `python3 tools/embed_assets.py` first. See [docs/embedded-assets.md](docs/embedded-assets.md) for details on the `data/` → PROGMEM pipeline and on dropping additional assets in.
 
-The library substitutes six placeholders at request time:
+The library substitutes these placeholders at request time:
 
 - `***options***` — `<option>` tags for each scanned network.
 - `***Connection Status***` — current connection state.
 - `***client_checked***` / `***repeater_checked***` — `checked` injected into whichever mode radio is currently saved.
 - `***hostname***` — the current device hostname (without `.local`).
 - `***battery***` — battery voltage and charge (e.g. `15.8 V · 72%`), or empty when battery monitoring is off.
+- `***battery_hidden***` — `hidden` when battery monitoring is off, otherwise empty; put it on the calibration form's tag.
+- `***battery_volts***` / `***battery_calibration***` — current battery voltage (2 decimals) and calibration factor for the calibration card, or empty when monitoring is off.
 
 You can replace the file with any markup you want as long as those placeholders and a form posting `network`, `password`, and `mode` to `/wifi` are present. The `hostname` field is optional; if a form omits it, the saved hostname is left unchanged.
 

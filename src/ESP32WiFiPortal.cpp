@@ -20,6 +20,11 @@ constexpr const char* kPrefNetworkKey = "network";
 constexpr const char* kPrefPasswordKey = "password";
 constexpr const char* kPrefModeKey = "mode";
 constexpr const char* kPrefHostnameKey = "hostname";
+constexpr const char* kPrefBatteryCalKey = "bat_cal";
+// Resistor tolerance plus ADC error lands well inside this; a factor
+// outside it means a wiring or divider-ratio mistake, not calibration.
+constexpr float kMinBatteryCalibration = 0.5f;
+constexpr float kMaxBatteryCalibration = 1.5f;
 constexpr const char* kModeClient = "client";
 constexpr const char* kModeRepeater = "repeater";
 constexpr const char* kRepeaterApSuffix = "-ext";
@@ -122,6 +127,10 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
     if (!ensurePreferences()) {
         return;
     }
+#ifdef ESP32WIFIPORTAL_BATTERY
+    // setBattery() usually runs before NVS is open.
+    loadSavedBatteryCalibration();
+#endif
 
     if (_ledPin >= 0) {
         pinMode(_ledPin, OUTPUT);
@@ -282,7 +291,11 @@ void ESP32WiFiPortal::enableOta(const String& password) { _otaPassword = passwor
 void ESP32WiFiPortal::enableBootLog() { _bootLogEnabled = true; }
 
 #ifdef ESP32WIFIPORTAL_BATTERY
-void ESP32WiFiPortal::setBattery(const BatteryConfig& config) { _battery.begin(config); }
+void ESP32WiFiPortal::setBattery(const BatteryConfig& config) {
+    _batteryDefaultCalibration = config.calibration;
+    _battery.begin(config);
+    loadSavedBatteryCalibration();
+}
 
 void ESP32WiFiPortal::setBatteryPin(int pin) {
     BatteryConfig config = _battery.config();
@@ -291,6 +304,43 @@ void ESP32WiFiPortal::setBatteryPin(int pin) {
 }
 
 BatteryConfig ESP32WiFiPortal::getBattery() const { return _battery.config(); }
+
+void ESP32WiFiPortal::loadSavedBatteryCalibration() {
+    if (!_prefsReady || !_prefs.isKey(kPrefBatteryCalKey)) return;
+    _battery.setCalibration(_prefs.getFloat(kPrefBatteryCalKey, _batteryDefaultCalibration));
+}
+
+// POST /battery with measured=<multimeter volts> saves measured / raw as
+// the calibration; reset=1 drops it back to the sketch's value.
+void ESP32WiFiPortal::handleBatteryCalibration() {
+    if (_server.method() != HTTP_POST) {
+        _server.send(405, "text/plain", "Use POST");
+        return;
+    }
+    if (_server.hasArg("reset")) {
+        if (_prefsReady) _prefs.remove(kPrefBatteryCalKey);
+        _battery.setCalibration(_batteryDefaultCalibration);
+        Serial.printf("[ESP32WiFiPortal] Battery calibration reset to %.4f\n",
+                      _batteryDefaultCalibration);
+    } else {
+        float measured = _server.arg("measured").toFloat();
+        float raw = _battery.active() ? _battery.readVolts() / _battery.config().calibration : 0.0f;
+        float factor = (raw > 0.5f) ? measured / raw : 0.0f;
+        if (factor < kMinBatteryCalibration || factor > kMaxBatteryCalibration) {
+            _server.send(400, "text/html",
+                         "<p>Calibration not saved: the board reads " + String(raw, 2) +
+                             " V before calibration, so " + String(measured, 2) +
+                             " V would need a factor outside 0.5&ndash;1.5. Check the "
+                             "wiring and divider ratio.</p><p><a href=\"/\">Back</a></p>");
+            return;
+        }
+        if (_prefsReady) _prefs.putFloat(kPrefBatteryCalKey, factor);
+        _battery.setCalibration(factor);
+        Serial.printf("[ESP32WiFiPortal] Battery calibration set to %.4f\n", factor);
+    }
+    _server.sendHeader("Location", "/", true);
+    _server.send(303, "text/plain", "");
+}
 #endif
 
 String ESP32WiFiPortal::batteryStatusText() const {
@@ -826,6 +876,19 @@ void ESP32WiFiPortal::handleConfigPage() {
     html.replace("***repeater_checked***", isRepeater ? "checked" : "");
     html.replace("***hostname***", _hostname);
     html.replace("***battery***", batteryStatusText());
+    String batteryHidden = "hidden";
+    String batteryVolts;
+    String batteryCalibration;
+#ifdef ESP32WIFIPORTAL_BATTERY
+    if (_battery.active()) {
+        batteryHidden = "";
+        batteryVolts = String(_battery.readVolts(), 2);
+        batteryCalibration = String(_battery.config().calibration, 4);
+    }
+#endif
+    html.replace("***battery_hidden***", batteryHidden);
+    html.replace("***battery_volts***", batteryVolts);
+    html.replace("***battery_calibration***", batteryCalibration);
     _server.send(200, "text/html", html);
 }
 
@@ -871,7 +934,8 @@ void ESP32WiFiPortal::handleStatusJson() {
         float volts = _battery.readVolts();
         json += ",\"battery\":{\"volts\":" + String(volts, 2) +
                 ",\"percent\":" + String(_battery.percentFor(volts)) +
-                ",\"cells\":" + String(_battery.cells()) + "}";
+                ",\"cells\":" + String(_battery.cells()) +
+                ",\"calibration\":" + String(_battery.config().calibration, 4) + "}";
     } else {
         json += ",\"battery\":null";
     }
@@ -889,6 +953,9 @@ void ESP32WiFiPortal::registerPages() {
     if (_bootLogEnabled) {
         _server.on("/bootlog", [this]() { this->handleBootLog(); });
     }
+#ifdef ESP32WIFIPORTAL_BATTERY
+    _server.on("/battery", [this]() { this->handleBatteryCalibration(); });
+#endif
     _server.onNotFound([this]() { this->handleCaptiveRedirect(); });
     _pagesRegistered = true;
 }

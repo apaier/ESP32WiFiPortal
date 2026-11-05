@@ -18,8 +18,14 @@ header p{margin:0;font-size:.85rem;color:var(--muted)}
 .ok .dot{background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
 .rep .dot{background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
 #st{min-width:0;overflow-wrap:anywhere}
-.bat{margin-left:auto;flex:none;text-align:right;font-size:.8rem;color:var(--muted);white-space:nowrap}
+.bat{margin-left:auto;flex:none;align-self:flex-end;align-self:last baseline;font-size:.75rem;color:var(--muted);white-space:nowrap}
 .bat:empty{display:none}
+.cell{display:inline-block;vertical-align:-1px;width:22px;height:11px;margin-right:6px;border:1.5px solid currentColor;border-radius:3px;padding:1px;position:relative}
+.cell:after{content:"";position:absolute;right:-4px;top:2.5px;width:2px;height:4px;border-radius:0 1px 1px 0;background:currentColor}
+.cell i{display:block;height:100%;border-radius:1px;background:var(--ok)}
+.cell.low i{background:var(--warn)}
+form[hidden]{display:none}
+.reading{margin:0;font-size:.875rem}
 #st small{display:block;color:var(--muted);font-size:.75rem;font-family:ui-monospace,Menlo,Consolas,monospace}
 form{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px;display:grid;gap:14px}
 .field{display:grid;gap:6px}
@@ -80,6 +86,19 @@ select.ctl{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 5
 </div>
 <button class="go" type="submit" id="go">Connect</button>
 </form>
+<form action="battery" method="post" ***battery_hidden***>
+<div class="legend">Battery calibration</div>
+<p class="reading">Board reads <b>***battery_volts*** V</b> &middot; factor ***battery_calibration***</p>
+<div class="field">
+<label for="measured">Multimeter reading at the battery</label>
+<div class="sfx"><input class="ctl" name="measured" id="measured" type="number" step="0.01" min="0" inputmode="decimal" required><span>V</span></div>
+<p class="hint">Measure while the board is running, then save. The board works out the correction and keeps it across reboots.</p>
+</div>
+<div class="row">
+<button class="go" type="submit">Calibrate</button>
+<button class="go" type="submit" name="reset" value="1" formnovalidate style="background:var(--field);color:var(--fg);border:1px solid var(--line)">Reset</button>
+</div>
+</form>
 </main>
 <script>
 // Firmware sends plain status text and "<ssid> - <rssi>" options; dress them up client-side.
@@ -87,6 +106,9 @@ var st=document.getElementById("st"),t=st.textContent,m=t.match(/^(.*?)(?: - | \
 document.getElementById("status").className="status"+(/^Connected/.test(t)?" ok":/^Repeating/.test(t)?" rep":"");
 if(m){st.textContent=m[1];var s=document.createElement("small");s.textContent=m[2].replace(/^(RSSI -?\d+)$/,"$1 dBm");st.appendChild(s);}
 [].forEach.call(document.querySelectorAll("#network option"),function(o){var r=o.textContent.match(/^(.*) - (-?\d+)$/);if(r){var v=+r[2];o.textContent=r[1]+" · "+(v>=-60?"Strong":v>=-72?"Good":"Weak");}});
+// Battery arrives as "15.8 V &middot; 72%"; show the percent with a gauge.
+var bat=document.querySelector(".bat"),bm=bat.textContent.match(/^(.*) · (\d+)%$/);
+if(bm){var p=+bm[2];bat.innerHTML='<span class="cell'+(p<20?' low':'')+'"><i style="width:'+p+'%"></i></span>'+p+'% · '+bm[1];}
 var pw=document.getElementById("password");
 document.getElementById("show").onclick=function(){var h=pw.type=="password";pw.type=h?"text":"password";this.textContent=h?"Hide":"Show";};
 document.getElementById("f").onsubmit=function(){var b=document.getElementById("go");b.disabled=true;b.innerHTML='<i class="spin"></i>Connecting&hellip;';};

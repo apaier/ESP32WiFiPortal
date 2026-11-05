@@ -60,6 +60,8 @@ public:
     void begin(const BatteryConfig& config);
     bool active() const;
     const BatteryConfig& config() const;
+    // Change only the calibration factor, keeping the rest of the config.
+    void setCalibration(float calibration);
 
     // Averaged battery voltage at the battery terminals. Takes ~1 ms.
     float readVolts() const;
