@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 - 2026-11-05
+
+- Device name has its own form and Save button on the setup page instead of riding along with the WiFi form, backed by the new `POST /api/hostname` (JSON for scripts). After a rename the page redirects to `http://<new-name>.local/`. WiFi forms that still send `hostname` keep working.
+
 ## 0.4.0 - 2026-11-05
 
 - Joins the strongest access point when several share the saved network name (mesh nodes, extenders). The default fast scan joined the first match found; connects now scan every channel and sort by signal, which also applies to the chip's own reconnects. Connecting takes about a second longer.
