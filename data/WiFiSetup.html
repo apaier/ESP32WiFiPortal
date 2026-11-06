@@ -79,12 +79,16 @@ select.ctl{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 5
 <label class="mode"><input type="radio" name="mode" value="repeater" ***repeater_checked***><div><b>Repeater</b><span>Share the connection over this device's own WiFi</span></div></label>
 </div>
 </div>
+<button class="go" type="submit" id="go">Connect</button>
+</form>
+<form action="api/hostname" method="post">
+<input type="hidden" name="from" value="page">
 <div class="field">
 <label for="hostname">Device name</label>
 <div class="sfx"><input class="ctl" name="hostname" id="hostname" value="***hostname***" maxlength="31" autocapitalize="none" autocorrect="off" spellcheck="false"><span>.local</span></div>
-<p class="hint">Letters, numbers and hyphens. Leave blank for the default.</p>
+<p class="hint">Letters, numbers and hyphens. Leave blank for the default. Changes the name without reconnecting WiFi.</p>
 </div>
-<button class="go" type="submit" id="go">Connect</button>
+<button class="go" type="submit">Save name</button>
 </form>
 <form action="api/battery/calibration" method="post" ***battery_hidden***>
 <input type="hidden" name="from" value="page">

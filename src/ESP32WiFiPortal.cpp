@@ -863,7 +863,9 @@ void ESP32WiFiPortal::persistCredentials(const String& network,
 
 void ESP32WiFiPortal::handleConfigPage() {
     if (_server.hasArg(kPrefNetworkKey)) {
-        // Apply before tryConnect so the new name goes out with DHCP.
+        // The built-in page renames through /api/hostname; this keeps
+        // custom setHtml() forms that still send hostname working.
+        // Applied before tryConnect so the new name goes out with DHCP.
         if (_server.hasArg(kPrefHostnameKey)) {
             applyHostname(_server.arg(kPrefHostnameKey));
         }
@@ -968,6 +970,29 @@ void ESP32WiFiPortal::handleConfigPage() {
     _server.send(200, "text/html", html);
 }
 
+// POST /api/hostname with hostname=<name> renames the device without
+// touching WiFi; blank goes back to the default. The setup page's form
+// sends from=page and is redirected to the page under the new name.
+void ESP32WiFiPortal::handleHostname() {
+    applyHostname(_server.arg(kPrefHostnameKey));
+    if (_server.arg("from") != "page") {
+        _server.send(200, "application/json", "{\"hostname\":" + jsonString(_hostname) + "}");
+        return;
+    }
+    // Reached via the old <name>.local, which stops resolving now; an
+    // IP address (AP mode, router lookup) keeps working as-is.
+    String host = _server.hostHeader();
+    int colon = host.indexOf(':');
+    String port = colon >= 0 ? host.substring(colon) : String();
+    if (colon >= 0) host = host.substring(0, colon);
+    String location = "/";
+    if (host.endsWith(".local")) {
+        location = "http://" + _hostname + ".local" + port + "/";
+    }
+    _server.sendHeader("Location", location, true);
+    _server.send(303, "text/plain", "");
+}
+
 void ESP32WiFiPortal::handleCaptiveRedirect() {
     if (_mode == WiFiPortalMode::AccessPoint) {
         String apIp = WiFi.softAPIP().toString();
@@ -1025,6 +1050,7 @@ void ESP32WiFiPortal::registerPages() {
     _server.on("/", handler);
     _server.on("/wifi", handler);
     _server.on("/api/status", HTTP_GET, [this]() { this->handleStatusJson(); });
+    _server.on("/api/hostname", HTTP_POST, [this]() { this->handleHostname(); });
     if (_bootLogEnabled) {
         _server.on("/api/bootlog", HTTP_GET, [this]() { this->handleBootLog(); });
         // POST so a prefetch or a reloaded bookmark can't wipe the log.

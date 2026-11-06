@@ -53,6 +53,7 @@ Machine-readable endpoints live under `/api/`; the setup page stays at `/`. Like
 | Route | Available | Purpose |
 |---|---|---|
 | `GET /api/status` | Always | Device snapshot as JSON (below) |
+| `POST /api/hostname` | Always | `hostname=<name>` renames the device without touching WiFi (blank = default); returns `{"hostname":…}` |
 | `GET /api/bootlog` | With `enableBootLog()` | Boot history as plain text |
 | `POST /api/bootlog/clear` | With `enableBootLog()` | Clear the boot history (keeps the current boot) |
 | `POST /api/battery/calibration` | With `-DESP32WIFIPORTAL_BATTERY` | `measured=<volts>` to calibrate, `reset=1` to go back to the sketch's value; returns `{"calibration":…}` or `{"error":…}` |
@@ -229,7 +230,7 @@ The library substitutes these placeholders at request time:
 - `***battery_hidden***` — `hidden` when battery monitoring is off, otherwise empty; put it on the calibration form's tag.
 - `***battery_volts***` / `***battery_calibration***` — current battery voltage (2 decimals) and calibration factor for the calibration card, or empty when monitoring is off.
 
-You can replace the file with any markup you want as long as those placeholders and a form submitting `network`, `password`, and `mode` to `/wifi` are present (use `method="post"` so the password stays out of the URL). The `hostname` field is optional; if a form omits it, the saved hostname is left unchanged. A blank `password` with the saved `network` keeps the saved password, and a submission that changes nothing about the connection doesn't reconnect.
+You can replace the file with any markup you want as long as those placeholders and a form submitting `network`, `password`, and `mode` to `/wifi` are present (use `method="post"` so the password stays out of the URL). The built-in page renames the device with a separate form posting `hostname` to `/api/hostname`, so a rename never reconnects WiFi. A `hostname` field in the WiFi form is still accepted for older custom pages; if a form omits it, the saved hostname is left unchanged. A blank `password` with the saved `network` keeps the saved password, and a submission that changes nothing about the connection doesn't reconnect.
 
 If you'd rather not touch `data/` at all, call `portal.setHtml(myHtmlBytes, myHtmlLen)` before `begin()` to override the compiled-in copy at runtime. The pointer must remain valid for the lifetime of the portal.
 

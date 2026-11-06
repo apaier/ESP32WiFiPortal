@@ -179,6 +179,7 @@ private:
     void persistCredentials(const String& network, const String& password,
                             const String& mode);
     void handleConfigPage();
+    void handleHostname();
     void handleCaptiveRedirect();
     void handleBootLog();
     void handleStatusJson();
