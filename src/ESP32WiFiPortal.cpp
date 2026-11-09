@@ -15,12 +15,23 @@ constexpr uint32_t kScanCadenceMs = 30UL * 1000UL;
 constexpr uint32_t kScanTimeoutMs = 15UL * 1000UL;
 constexpr uint32_t kBlindRetryFloorMs = 15UL * 60UL * 1000UL;
 constexpr uint8_t kSoftFailEventsBeforeFallback = 10;
+// Retry cadence after an auth/handshake failure: doubles from first to
+// max. Slow enough not to hammer a router over a real password change,
+// fast enough to ride out a router reboot.
+constexpr uint32_t kHardFailBackoffFirstMs = 2UL * 60UL * 1000UL;
+constexpr uint32_t kHardFailBackoffMaxMs = 30UL * 60UL * 1000UL;
+// Last resort: reboot after this long in AP mode with saved credentials
+// and nobody on the portal, in case the radio or stack is wedged.
+constexpr uint32_t kOfflineRebootMs = 60UL * 60UL * 1000UL;
 constexpr const char* kPrefsNamespace = "wifi_portal";
 constexpr const char* kPrefNetworkKey = "network";
 constexpr const char* kPrefPasswordKey = "password";
 constexpr const char* kPrefModeKey = "mode";
 constexpr const char* kPrefHostnameKey = "hostname";
 constexpr const char* kPrefBatteryCalKey = "bat_cal";
+constexpr const char* kPrefLastFallbackKey = "last_fall";
+constexpr const char* kPrefOfflineRebootsKey = "off_rbts";
+constexpr const char* kPrefRebootPendingKey = "rbt_pend";
 // Resistor tolerance plus ADC error lands well inside this; a factor
 // outside it means a wiring or divider-ratio mistake, not calibration.
 constexpr float kMinBatteryCalibration = 0.5f;
@@ -127,7 +138,15 @@ ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
       _lastScanMs(0),
       _softFailEventCount(0),
       _hardFail(false),
+      _hardFailSinceMs(0),
+      _hardFailBackoffMs(0),
       _lastBlindRetryMs(0),
+      _offline(false),
+      _offlineSinceMs(0),
+      _lastFallback{},
+      _lastFallbackThisBoot(false),
+      _offlineReboots(0),
+      _bootAfterOfflineReboot(false),
       _eventsRegistered(false),
       _disconnectEventPending(false),
       _disconnectReason(0) {}
@@ -149,6 +168,7 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
     // setBattery() usually runs before NVS is open.
     loadSavedBatteryCalibration();
 #endif
+    loadFallbackRecord();
 
     if (_ledPin >= 0) {
         pinMode(_ledPin, OUTPUT);
@@ -178,6 +198,10 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
     registerWiFiEvents();
 
     if (!loadAndConnect()) {
+        // After an offline reboot the original cause is the useful one.
+        if (haveSavedCredentials() && !_bootAfterOfflineReboot) {
+            recordFallback(FallbackCause::BootConnectFailed, _disconnectReason);
+        }
         startAccessPoint();
     }
 
@@ -204,8 +228,18 @@ void ESP32WiFiPortal::loop() {
 
     bool inApMode = (_mode == WiFiPortalMode::AccessPoint);
     bool haveCreds = haveSavedCredentials();
-    if (inApMode && haveCreds && !_hardFail && !_scanInFlight) {
-        if ((millis() - _lastScanMs) >= kScanCadenceMs) {
+    // Reconnect attempts take the AP down for up to 30 s, so hold off
+    // while someone is on the portal.
+    if (inApMode && haveCreds && !_scanInFlight && WiFi.softAPgetStationNum() == 0) {
+        if (_offline && (millis() - _offlineSinceMs) >= kOfflineRebootMs) {
+            rebootWhileOffline();
+        }
+        if (_hardFail) {
+            if ((millis() - _hardFailSinceMs) >= _hardFailBackoffMs) {
+                Serial.println("[ESP32WiFiPortal] Hard-fail backoff elapsed; retrying");
+                attemptReconnect();
+            }
+        } else if ((millis() - _lastScanMs) >= kScanCadenceMs) {
             startScan();
         } else if ((millis() - _lastBlindRetryMs) >= kBlindRetryFloorMs) {
             // Hidden SSIDs and DFS-channel APs may never appear in passive
@@ -493,7 +527,8 @@ void ESP32WiFiPortal::handleDisconnectEvent() {
     if (isHardFailReason(reason)) {
         Serial.printf("[ESP32WiFiPortal] Hard-fail disconnect (reason %u); to AP\n",
                       reason);
-        _hardFail = true;
+        recordFallback(FallbackCause::HardFail, reason);
+        enterHardFail(reason);
         // Stop the chip from auto-reassociating with bad credentials.
         WiFi.disconnect(false, true);
         startAccessPoint();
@@ -509,8 +544,70 @@ void ESP32WiFiPortal::handleDisconnectEvent() {
                   kSoftFailEventsBeforeFallback);
     if (_softFailEventCount >= kSoftFailEventsBeforeFallback) {
         Serial.println("[ESP32WiFiPortal] Soft-fail count exceeded; to AP");
+        recordFallback(FallbackCause::SoftFail, reason);
         startAccessPoint();
     }
+}
+
+void ESP32WiFiPortal::enterHardFail(uint8_t reason) {
+    _hardFail = true;
+    _hardFailSinceMs = millis();
+    _hardFailBackoffMs = _hardFailBackoffMs == 0
+                             ? kHardFailBackoffFirstMs
+                             : min(_hardFailBackoffMs * 2, kHardFailBackoffMaxMs);
+    Serial.printf("[ESP32WiFiPortal] Hard fail (reason %u); retrying in %lu s\n",
+                  reason, (unsigned long)(_hardFailBackoffMs / 1000UL));
+}
+
+void ESP32WiFiPortal::loadFallbackRecord() {
+    if (!_prefsReady) return;
+    if (_prefs.isKey(kPrefLastFallbackKey) &&
+        _prefs.getBytesLength(kPrefLastFallbackKey) == sizeof(_lastFallback)) {
+        _prefs.getBytes(kPrefLastFallbackKey, &_lastFallback, sizeof(_lastFallback));
+    }
+    _offlineReboots = _prefs.getUInt(kPrefOfflineRebootsKey, 0);
+    if (_prefs.isKey(kPrefRebootPendingKey)) {
+        _bootAfterOfflineReboot = true;
+        _prefs.remove(kPrefRebootPendingKey);
+    }
+}
+
+void ESP32WiFiPortal::recordFallback(FallbackCause cause, uint8_t reason) {
+    _lastFallback.cause = static_cast<uint8_t>(cause);
+    _lastFallback.reason = reason;
+    _lastFallback.uptimeS = (uint32_t)(esp_timer_get_time() / 1000000LL);
+    _lastFallback.count++;
+    _lastFallbackThisBoot = true;
+    if (_prefsReady) {
+        _prefs.putBytes(kPrefLastFallbackKey, &_lastFallback, sizeof(_lastFallback));
+    }
+}
+
+// e.g. "auth/handshake failure (4WAY_HANDSHAKE_TIMEOUT)"
+String ESP32WiFiPortal::fallbackText() const {
+    String text;
+    switch (static_cast<FallbackCause>(_lastFallback.cause)) {
+        case FallbackCause::HardFail: text = "auth/handshake failure"; break;
+        case FallbackCause::SoftFail: text = "repeated disconnects"; break;
+        case FallbackCause::BootConnectFailed: text = "couldn't join at boot"; break;
+        default: return String();
+    }
+    if (_lastFallback.reason != 0) {
+        text += String(" (") +
+                WiFi.disconnectReasonName((wifi_err_reason_t)_lastFallback.reason) + ")";
+    }
+    return text;
+}
+
+void ESP32WiFiPortal::rebootWhileOffline() {
+    Serial.printf("[ESP32WiFiPortal] Offline for %lu min; rebooting\n",
+                  (unsigned long)(kOfflineRebootMs / 60000UL));
+    if (_prefsReady) {
+        _prefs.putUInt(kPrefOfflineRebootsKey, _offlineReboots + 1);
+        _prefs.putBool(kPrefRebootPendingKey, true);
+    }
+    delay(100);
+    ESP.restart();
 }
 
 String ESP32WiFiPortal::loadSavedSsid() {
@@ -643,6 +740,7 @@ void ESP32WiFiPortal::handleScanResult(int count) {
 
 void ESP32WiFiPortal::attemptReconnect() {
     if (!haveSavedCredentials()) return;
+    if (WiFi.softAPgetStationNum() > 0) return;  // someone is on the portal
     Serial.println("[ESP32WiFiPortal] Attempting saved network");
     if (!loadAndConnect()) {
         startAccessPoint();
@@ -651,8 +749,11 @@ void ESP32WiFiPortal::attemptReconnect() {
 
 bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
                                  const String& mode) {
-    _hardFail = false;
     _softFailEventCount = 0;
+    // Clear leftovers so the reason we read on failure, and any event
+    // loop() sees after success, belong to this attempt.
+    _disconnectReason = 0;
+    _disconnectEventPending = false;
     // Switch DNS off while we transition. CaptivePortal-mode lying and
     // Forwarder-mode proxying both stop making sense the moment the AP
     // goes away; we'll re-arm whichever mode is appropriate once the
@@ -691,10 +792,30 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     Serial.println();
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[ESP32WiFiPortal] Connection failed");
+        uint8_t reason = _disconnectReason;
+        Serial.printf("[ESP32WiFiPortal] Connection failed (reason %u)\n", reason);
+        if (isHardFailReason(reason)) {
+            enterHardFail(reason);
+        } else {
+            // Not an auth problem (e.g. AP not found): go back to
+            // scan-and-pounce. The backoff length is kept, so a later
+            // hard fail keeps growing it.
+            _hardFail = false;
+        }
         return false;
     }
 
+    // The chip may have failed an association (e.g. a handshake timeout)
+    // before its own retry succeeded. That disconnect event is stale now;
+    // left pending, loop() would treat it as a fresh drop and fall back.
+    _disconnectEventPending = false;
+    _hardFail = false;
+    _hardFailBackoffMs = 0;
+    if (_offline) {
+        Serial.printf("[ESP32WiFiPortal] Back online after %lu s\n",
+                      (unsigned long)((millis() - _offlineSinceMs) / 1000UL));
+        _offline = false;
+    }
     _mode = WiFiPortalMode::Connected;
     _bootLog.mark(BootLog::Stage::NetworkUp);
     Serial.print("[ESP32WiFiPortal] Connected, IP ");
@@ -709,6 +830,10 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
 
 void ESP32WiFiPortal::startAccessPoint() {
     _mode = WiFiPortalMode::AccessPoint;
+    if (!_offline) {
+        _offline = true;
+        _offlineSinceMs = millis();
+    }
     _scanInFlight = false;
     _softFailEventCount = 0;
     // Defer the first scan/retry by their full cadence so the AP has time
@@ -890,7 +1015,15 @@ void ESP32WiFiPortal::handleConfigPage() {
         bool unchanged = network == savedNetwork && password == savedPassword &&
                          submittedMode == savedMode;
         if (!(online && unchanged)) {
-            tryConnect(network, password, submittedMode);
+            // New input from a person: start fresh rather than waiting
+            // out a backoff from the old attempt.
+            _hardFail = false;
+            _hardFailBackoffMs = 0;
+            // tryConnect switched to STA-only, so without this a failed
+            // attempt left the device with no AP and no connection.
+            if (!tryConnect(network, password, submittedMode)) {
+                startAccessPoint();
+            }
         }
     }
 
@@ -945,6 +1078,12 @@ void ESP32WiFiPortal::handleConfigPage() {
         status = "Connected to " + htmlEscape(WiFi.SSID()) + " (RSSI " + WiFi.RSSI() + ")";
     } else {
         status = "Access Point Mode - IP " + WiFi.softAPIP().toString();
+        if (_lastFallbackThisBoot) status += " &middot; Lost network: " + fallbackText();
+        if (_hardFail) {
+            uint32_t elapsed = millis() - _hardFailSinceMs;
+            uint32_t left = elapsed < _hardFailBackoffMs ? _hardFailBackoffMs - elapsed : 0;
+            status += " &middot; Retrying in " + String((left + 59999UL) / 60000UL) + " min";
+        }
     }
 
     bool isRepeater = (_mode == WiFiPortalMode::Repeating);
@@ -1029,6 +1168,23 @@ void ESP32WiFiPortal::handleStatusJson() {
             String(_probeTask == nullptr ? "null" : (_internetOk ? "true" : "false"));
     json += ",\"ap_ssid\":" + (apUp ? jsonString(WiFi.softAPSSID()) : String("null"));
     json += ",\"ap_clients\":" + (apUp ? String(WiFi.softAPgetStationNum()) : String("null"));
+    if (_lastFallback.cause != 0) {
+        json += ",\"last_fallback\":{\"cause\":" + jsonString(fallbackText());
+        json += ",\"reason\":" + String(_lastFallback.reason);
+        json += ",\"uptime_s\":" + String(_lastFallback.uptimeS);
+        json += ",\"this_boot\":" + String(_lastFallbackThisBoot ? "true" : "false");
+        json += ",\"count\":" + String(_lastFallback.count) + "}";
+    } else {
+        json += ",\"last_fallback\":null";
+    }
+    json += ",\"offline_reboots\":" + String(_offlineReboots);
+    if (_mode == WiFiPortalMode::AccessPoint && _hardFail) {
+        uint32_t elapsed = millis() - _hardFailSinceMs;
+        uint32_t left = elapsed < _hardFailBackoffMs ? _hardFailBackoffMs - elapsed : 0;
+        json += ",\"retry_in_s\":" + String(left / 1000UL);
+    } else {
+        json += ",\"retry_in_s\":null";
+    }
 #ifdef ESP32WIFIPORTAL_BATTERY
     if (_battery.active()) {
         float volts = _battery.readVolts();

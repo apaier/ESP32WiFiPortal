@@ -10,9 +10,11 @@ to fall back to the configuration AP. Read this when changing anything in
    reconnect on its own without rebooting.
 2. If the network is out of range or down, the device should keep the
    configuration AP available so a human can intervene.
-3. If the saved credentials are wrong (e.g. the user typed the password
-   incorrectly), the device should not keep blindly retrying — it should
-   fall back to the captive portal immediately and wait for the user.
+3. If the saved credentials look wrong (auth/handshake failure), the
+   device should fall back to the captive portal immediately and retry
+   only on a slow, growing backoff. It must not stop retrying: these
+   reason codes also show up transiently (router rebooting, weak
+   signal), and saved credentials have, by definition, worked before.
 4. Reconnect attempts should not pointlessly disrupt the AP. Tearing down
    the captive portal for a 30-second `WiFi.begin()` attempt while the
    network is genuinely gone is wasteful.
@@ -61,8 +63,12 @@ Transitions in plain English:
   one-second blip while still recovering from genuinely-gone networks
   within a minute or so.
 - **AP mode → Connected/Repeating** — async scan finds the saved SSID
-  in the results; `attemptReconnect()` calls `loadAndConnect()` which
-  re-runs `tryConnect`.
+  in the results (or, after a hard fail, the backoff elapses);
+  `attemptReconnect()` calls `loadAndConnect()` which re-runs
+  `tryConnect`.
+- **AP mode → reboot** — saved credentials, no portal clients, and no
+  successful join for `kOfflineRebootMs` (1 hour). Last resort for a
+  wedged radio or stack.
 
 ## Why we don't scan from the Connected side
 
@@ -125,18 +131,57 @@ Read from `info.wifi_sta_disconnected.reason` on
 | `CONNECTION_FAIL` (205)      | Soft  | Generic transient failure.       |
 | everything else              | Soft  | Default to "let count decide".   |
 
-Hard-fail flips `_hardFail = true`, calls `WiFi.disconnect(false, true)`
-to clear the chip's auto-reconnect credentials, and immediately enters
-AP mode. `_hardFail` is cleared the next time `tryConnect` runs (which
-happens on a fresh form submission via the captive portal). The portal's
-periodic scan-and-pounce is suppressed while `_hardFail` is set so the
-device doesn't burn power retrying creds that can't work.
+Hard-fail calls `enterHardFail()`, which sets `_hardFail = true` and
+starts a backoff: `kHardFailBackoffFirstMs` (2 min), doubling on each
+further hard fail up to `kHardFailBackoffMaxMs` (30 min). It also calls
+`WiFi.disconnect(false, true)` to clear the chip's auto-reconnect
+credentials and immediately enters AP mode. While `_hardFail` is set,
+scan-and-pounce is replaced by one `attemptReconnect()` each time the
+backoff elapses. A failed `tryConnect` re-enters hard fail (longer
+backoff) if the reason was a hard one; otherwise it clears `_hardFail`
+and returns to scan-and-pounce, keeping the backoff length. A successful
+join, or a form submission from the portal, resets the backoff.
+
+**History.** Hard fail used to stop all retries until a form submission
+or reboot. In the field, a repeater with known-good credentials sat in
+AP mode (slow blink) until it was power-cycled: a transient handshake
+failure had been treated as a wrong password.
+
+**Stale disconnect events.** `tryConnect` clears `_disconnectReason` and
+`_disconnectEventPending` before connecting, and clears the pending flag
+again on success. Without that, an attempt whose first association
+failed (e.g. reason 15) but which the chip's own retry then completed
+left a pending event that `loop()` handled as a fresh hard-fail drop
+right after we entered Connected.
 
 The library's Preferences entries are **not** wiped on hard-fail. The
 portal still has the bad SSID/password available to prefill so the user
 can edit instead of retyping from scratch. The chip-internal credentials
 (separate from our `wifi_portal` namespace, written by
 `esp_wifi_set_config`) are the only thing cleared.
+
+## Portal clients block reconnects
+
+Every reconnect attempt switches to `WIFI_STA` and takes the AP down for
+up to `kConnectAttemptSeconds`. While any station is joined to the AP
+(`WiFi.softAPgetStationNum() > 0`), `loop()` skips scans, retries and the
+offline reboot, and `attemptReconnect()` returns early, so someone fixing
+the device from the portal isn't kicked off. Attempts resume once they
+leave.
+
+A failed form submission now calls `startAccessPoint()`. Previously
+`tryConnect` had already switched to STA-only, so a failed submit left
+the device with neither an AP nor a connection.
+
+## Fallback diagnostics
+
+Each fallback to AP with saved credentials (hard fail, soft-fail
+threshold, or failing to join at boot) is written to NVS as
+`last_fall` (cause, disconnect reason, uptime, running count), and the
+offline-reboot count as `off_rbts`. Both appear in `/api/status`, and
+the AP-mode status line on the setup page shows the cause and retry
+time. Boot failures after an offline reboot aren't recorded (flagged by
+`rbt_pend`), so the original cause isn't overwritten.
 
 ## Auto-reconnect lifecycle
 
@@ -274,9 +319,16 @@ All in the anonymous namespace at the top of `ESP32WiFiPortal.cpp`:
 | `kScanTimeoutMs`                  | 15s     | How long to wait before declaring an in-flight scan stuck. |
 | `kBlindRetryFloorMs`              | 15min   | Blind reconnect cadence (hidden SSIDs / DFS). |
 | `kSoftFailEventsBeforeFallback`   | 10      | Consecutive soft-fail disconnect events before falling back from Connected/Repeating to AP. With chip auto-reconnect on, events arrive every few seconds — so 10 ≈ 30-60 seconds of confirmed failure. |
+| `kHardFailBackoffFirstMs`         | 2min    | First retry delay after an auth/handshake failure. Doubles per consecutive hard fail. |
+| `kHardFailBackoffMaxMs`           | 30min   | Cap on that backoff. |
+| `kOfflineRebootMs`                | 1h      | Reboot after this long in AP mode with saved credentials and no portal clients. |
 | `kConnectAttemptSeconds`          | 30      | How long a single `WiFi.begin` attempt waits before declaring failure. Pre-existing, unchanged. |
 
 ## Known limitations
+
+- **Offline reboots fill the boot log.** During a long outage the device
+  reboots hourly, and the boot log keeps only 8 entries, so a long
+  outage pushes out older history.
 
 - **Hidden SSIDs reconnect slowly.** Scan-and-pounce never fires; only the
   15-minute blind floor catches them. If hidden SSIDs become a primary

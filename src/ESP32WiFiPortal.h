@@ -142,8 +142,36 @@ private:
     uint32_t _scanStartedMs;
     uint32_t _lastScanMs;
     uint8_t _softFailEventCount;
+    // Set after an auth/handshake failure on the saved network. These
+    // are often transient (router rebooting, weak signal), so retries
+    // continue on a growing backoff rather than stopping.
     bool _hardFail;
+    uint32_t _hardFailSinceMs;
+    uint32_t _hardFailBackoffMs;  // 0 until the first hard fail
     uint32_t _lastBlindRetryMs;
+    // True from falling back to AP until the next successful join.
+    bool _offline;
+    uint32_t _offlineSinceMs;
+
+    // Why the device last dropped to AP mode with saved credentials,
+    // persisted in NVS so it survives the power cycle that fixes it.
+    enum class FallbackCause : uint8_t {
+        None = 0,
+        HardFail = 1,
+        SoftFail = 2,
+        BootConnectFailed = 3,
+    };
+    struct FallbackRecord {
+        uint8_t cause;
+        uint8_t reason;  // last WiFi disconnect reason, 0 if none
+        uint16_t reserved;
+        uint32_t uptimeS;  // uptime when it happened
+        uint32_t count;    // fallbacks recorded since NVS was cleared
+    };
+    FallbackRecord _lastFallback;
+    bool _lastFallbackThisBoot;
+    uint32_t _offlineReboots;
+    bool _bootAfterOfflineReboot;
     bool _eventsRegistered;
     // Written by the WiFi event task, read by loop().
     volatile bool _disconnectEventPending;
@@ -159,6 +187,11 @@ private:
     void handleScanResult(int count);
     void handleDisconnectEvent();
     bool isHardFailReason(uint8_t reason) const;
+    void enterHardFail(uint8_t reason);
+    void loadFallbackRecord();
+    void recordFallback(FallbackCause cause, uint8_t reason);
+    String fallbackText() const;
+    void rebootWhileOffline();
     String loadSavedSsid();
     void attemptReconnect();
     void startAccessPoint();
