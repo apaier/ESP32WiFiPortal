@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 - 2026-11-09
+
+- Auth/handshake failures on the saved network no longer leave the device in AP mode until rebooted. `AUTH_FAIL`, `ASSOC_FAIL`, `HANDSHAKE_TIMEOUT` and `4WAY_HANDSHAKE_TIMEOUT` also happen transiently (router rebooting, weak signal), so the device now retries after 2 minutes, doubling up to 30 minutes, instead of waiting for a form submission. Seen in the field as a repeater stuck on slow blink until power-cycled.
+- Fixed a stale disconnect event causing a false fallback. If a connect attempt's first association failed and the chip's own retry then succeeded, the leftover event was handled as a fresh hard-fail drop right after joining.
+- Fixed a failed setup-form submission leaving the device with no AP and no connection; it now returns to AP mode.
+- Reconnect attempts, scans and the offline reboot are held off while a device is joined to the setup AP, so the portal isn't torn down under someone using it.
+- Last resort: after 1 hour in AP mode with saved credentials and nobody on the portal, the device reboots.
+- Fallback diagnostics. The cause of the last drop to AP mode (hard fail, repeated disconnects, or no join at boot), the WiFi reason code, the uptime, and a count are saved in NVS and reported in `/api/status` as `last_fallback`, with `offline_reboots` and `retry_in_s`. The setup page's AP-mode status line shows the cause and retry time.
+
 ## 0.4.1 - 2026-11-05
 
 - Device name has its own form and Save button on the setup page instead of riding along with the WiFi form, backed by the new `POST /api/hostname` (JSON for scripts). After a rename the page redirects to `http://<new-name>.local/`. WiFi forms that still send `hostname` keep working.
