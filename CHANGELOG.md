@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.5 - 2026-11-17
 
 - Renaming no longer deletes other code's mDNS services (#12). A rename used to restart the mDNS responder (`MDNS.end()` is `mdns_free()`), discarding every service the library didn't add, such as HomeSpan's `_hap._tcp`, and the instance name, until reboot. The library now renames in place with `mdns_hostname_set()`, starts the responder only if nothing else has (so it also works when the sketch starts mDNS first), and adds its own `_http._tcp` / `_arduino._tcp` only if they aren't already advertised.
 - `rename(name)` renames the device from code after `begin()`, saving it like the setup page and `POST /api/hostname` do.
