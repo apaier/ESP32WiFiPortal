@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.4 - 2026-11-17
 
 - `GET /api/scan` lists every access point the board can hear for its network, strongest first, with BSSID, RSSI, channel, security and which one it's joined to (`all=1` for every network). For diagnosing a board that joins a weaker mesh node: it shows whether the board hears a stronger one at all.
 
