@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Renaming no longer deletes other code's mDNS services (#12). A rename used to restart the mDNS responder (`MDNS.end()` is `mdns_free()`), discarding every service the library didn't add, such as HomeSpan's `_hap._tcp`, and the instance name, until reboot. The library now renames in place with `mdns_hostname_set()`, starts the responder only if nothing else has (so it also works when the sketch starts mDNS first), and adds its own `_http._tcp` / `_arduino._tcp` only if they aren't already advertised.
+- `rename(name)` renames the device from code after `begin()`, saving it like the setup page and `POST /api/hostname` do.
+- `onHostnameChanged(callback)` is called with the new name whenever it changes (setup page, `POST /api/hostname` or `rename()`), so a sketch can keep its own mDNS-dependent names, such as a HomeKit display name or OTA hostname, in step with the library's.
+
 ## 0.4.4 - 2026-11-17
 
 - `GET /api/scan` lists every access point the board can hear for its network, strongest first, with BSSID, RSSI, channel, security and which one it's joined to (`all=1` for every network). For diagnosing a board that joins a weaker mesh node: it shows whether the board hears a stronger one at all.

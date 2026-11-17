@@ -5,6 +5,7 @@
 
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <mdns.h>
 #include <WiFi.h>
 #include <esp_netif.h>
 #include <esp_timer.h>
@@ -241,6 +242,7 @@ void ESP32WiFiPortal::begin(const String& accessPointName,
     _server.begin();
     startOta();
     startMdns();
+    _begun = true;
 }
 
 void ESP32WiFiPortal::loop() {
@@ -403,6 +405,18 @@ void ESP32WiFiPortal::setHostname(const String& hostname) {
 }
 
 String ESP32WiFiPortal::getHostname() const { return _hostname; }
+
+void ESP32WiFiPortal::rename(const String& hostname) {
+    if (!_begun) {
+        Serial.println("[ESP32WiFiPortal] rename() before begin() ignored; use setHostname()");
+        return;
+    }
+    applyHostname(hostname);
+}
+
+void ESP32WiFiPortal::onHostnameChanged(std::function<void(const String&)> callback) {
+    _hostnameChangedCallback = callback;
+}
 
 void ESP32WiFiPortal::enableOta(const String& password) { _otaPassword = password; }
 
@@ -742,21 +756,34 @@ void ESP32WiFiPortal::applyHostname(const String& hostname) {
     WiFi.STA.setHostname(_hostname.c_str());
     WiFi.AP.setHostname(_hostname.c_str());
     startMdns();
+    Serial.printf("[ESP32WiFiPortal] Hostname changed to %s\n", _hostname.c_str());
+    if (_hostnameChangedCallback) _hostnameChangedCallback(_hostname);
 }
 
 void ESP32WiFiPortal::startMdns() {
-    // The mDNS responder binds to the STA and AP netifs as they come and
-    // go, so one start covers every mode. Restart only on rename.
-    if (_mdnsStarted) {
-        MDNS.end();
-        _mdnsStarted = false;
-    }
-    if (!MDNS.begin(_hostname.c_str())) {
+    // The responder is shared with the sketch and its libraries (e.g.
+    // HomeSpan adds _hap._tcp and sets the instance name). Never tear it
+    // down: MDNS.end() is mdns_free(), which discards every service and
+    // the instance name. Start it only if nobody has (MDNS.begin() fails
+    // when it's already running), otherwise just rename in place. The
+    // responder follows the STA and AP netifs as they come and go, so one
+    // start covers every mode.
+    char current[MDNS_NAME_BUF_LEN];
+    bool running = mdns_hostname_get(current) != ESP_ERR_INVALID_STATE;
+    if (!running && mdns_init() != ESP_OK) {
         Serial.println("[ESP32WiFiPortal] mDNS start failed");
         return;
     }
-    MDNS.addService("http", "tcp", _port);
-    if (_otaStarted) MDNS.enableArduino(kOtaPort, /*auth=*/true);
+    if (mdns_hostname_set(_hostname.c_str()) != ESP_OK) {
+        Serial.println("[ESP32WiFiPortal] mDNS hostname set failed");
+        return;
+    }
+    // Add ours only if missing: a rename keeps them, and the sketch may
+    // already advertise its own.
+    if (!mdns_service_exists("_http", "_tcp", NULL)) MDNS.addService("http", "tcp", _port);
+    if (_otaStarted && !mdns_service_exists("_arduino", "_tcp", NULL)) {
+        MDNS.enableArduino(kOtaPort, /*auth=*/true);
+    }
     _mdnsStarted = true;
     Serial.printf("[ESP32WiFiPortal] mDNS: http://%s.local/\n", _hostname.c_str());
 }
