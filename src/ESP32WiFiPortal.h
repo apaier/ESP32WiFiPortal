@@ -74,6 +74,20 @@ public:
     void setHostname(const String& hostname);
     String getHostname() const;
 
+    // Rename the device after begin(): saves the name to NVS (clearing it
+    // if it equals the setHostname() default) and applies it in place, as
+    // POST /api/hostname does. mDNS is renamed without restarting the
+    // responder, so services other code added (e.g. HomeSpan's _hap._tcp)
+    // survive; DHCP sends the new name at the next lease renewal. Ignored
+    // before begin(); use setHostname() for the default instead.
+    void rename(const String& hostname);
+
+    // Called with the new name whenever the hostname changes: from
+    // POST /api/hostname, the setup page, or rename(). Runs from loop(),
+    // so it's safe to update a sketch's own mDNS-dependent pieces there
+    // (HomeKit display name, OTA hostname, ...).
+    void onHostnameChanged(std::function<void(const String&)> callback);
+
     // Accept firmware over the network (ArduinoOTA on UDP/TCP 3232),
     // advertised over mDNS as <hostname>.local. An empty password leaves
     // OTA disabled; the library refuses to run OTA unauthenticated.
@@ -130,6 +144,8 @@ private:
     String _defaultHostname;
     String _hostname;
     bool _mdnsStarted;
+    bool _begun = false;
+    std::function<void(const String&)> _hostnameChangedCallback;
     String _otaPassword;
     bool _otaStarted;
     const uint8_t* _htmlOverride;

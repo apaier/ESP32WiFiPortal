@@ -21,6 +21,18 @@ The device announces itself over mDNS as `<hostname>.local` (with an `_http._tcp
 - The default hostname is the AP name passed to `begin()`, lowercased and reduced to letters, digits and hyphens (`ESP32-Portal-Setup` → `esp32-portal-setup`). Call `setHostname()` before `begin()` to choose a different default.
 - The config form has a **Device name** field. A name entered there is saved to NVS (key `hostname`) and overrides the sketch default; clearing the field reverts to the default.
 - Names are capped at 31 characters.
+- `rename(name)` does the same as the Device name field from code, after `begin()`: it saves the name (or clears it if it's the default) and applies it in place.
+- `onHostnameChanged(callback)` is called with the new name whenever it changes, from the form, `POST /api/hostname` or `rename()`. It runs from `portal.loop()`.
+
+The mDNS responder is shared with the rest of the sketch. The library starts it only if nothing else has, renames it in place, and adds its own `_http._tcp` (and `_arduino._tcp` with OTA) only if they aren't already advertised, so services other code adds, such as HomeSpan's `_hap._tcp` and instance name, survive a rename. A sketch with its own mDNS-dependent pieces can use the library's name as the single source of truth:
+
+```cpp
+portal.begin("DeskLight-Setup");
+startMyServices(portal.getHostname());     // pass the library's name to your own setup
+portal.onHostnameChanged([](const String& name) {
+    // update anything that cached the old name, e.g. a display name or OTA hostname
+});
+```
 
 ### OTA updates
 
@@ -228,6 +240,8 @@ void           on(const char* uri, WebServer::THandlerFunction handler);
 void setLedPin(int pin, bool activeLow = false); // optional status LED (see below)
 void setHostname(const String& hostname);         // DHCP / mDNS name (<name>.local)
 String getHostname() const;
+void rename(const String& hostname);              // save + apply a new name after begin()
+void onHostnameChanged(std::function<void(const String&)> callback);
 void enableOta(const String& password);           // OTA updates; empty = disabled
 void enableBootLog();                             // reset history at boot + /api/bootlog
 void setBattery(const BatteryConfig& config);     // needs -DESP32WIFIPORTAL_BATTERY
