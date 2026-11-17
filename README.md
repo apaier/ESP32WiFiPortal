@@ -53,6 +53,7 @@ Machine-readable endpoints live under `/api/`; the setup page stays at `/`. Like
 | Route | Available | Purpose |
 |---|---|---|
 | `GET /api/status` | Always | Device snapshot as JSON (below) |
+| `GET /api/scan` | Always | Access points the board can hear for its network, strongest first (below) |
 | `POST /api/hostname` | Always | `hostname=<name>` renames the device without touching WiFi (blank = default); returns `{"hostname":…}` |
 | `GET /api/bootlog` | With `enableBootLog()` | Boot history as plain text |
 | `POST /api/bootlog/clear` | With `enableBootLog()` | Clear the boot history (keeps the current boot) |
@@ -76,6 +77,16 @@ Machine-readable endpoints live under `/api/`; the setup page stays at `/`. Like
 `bssid` and `channel` identify the access point the board is joined to, for networks where several share the SSID (mesh nodes, extenders); both are `null` when not joined. `link_down_s` is how long the upstream link has been down while the board is meant to be joined, otherwise `null`; after 2 minutes the board falls back to the setup AP and starts looking for the network again. `last_disconnect` is the most recent disconnect seen while joined, since boot: the WiFi `reason` code, its `reason_name`, the uptime when it happened and a running `count`; `null` until one happens.
 
 `last_fallback` records the most recent time the device lost its saved network and dropped to the setup AP: why, the WiFi disconnect `reason` code, the uptime when it happened, whether it was during this boot, and a running `count`. It's kept in NVS, so it survives a power cycle; it is `null` if that has never happened. `offline_reboots` counts the reboots the device has done after an hour stuck offline. `retry_in_s` is the time until the next reconnect attempt after an auth/handshake failure, otherwise `null`. When the device is in AP mode, the setup page's status line shows the same cause and retry time.
+
+`GET /api/scan` scans and lists every access point broadcasting the saved network's name (or the joined one), as the board hears it on 2.4 GHz, strongest first:
+
+```json
+{"ssid":"HomeNet","joined_bssid":"A4:2B:B0:11:22:33","joined_rssi":-78,"scan_ms":2140,
+ "aps":[{"bssid":"A4:2B:B0:44:55:66","rssi":-61,"channel":1,"auth":"WPA2/WPA3","joined":false},
+        {"bssid":"A4:2B:B0:11:22:33","rssi":-77,"channel":6,"auth":"WPA2/WPA3","joined":true}]}
+```
+
+Use it on mesh networks to see why the board joined a particular node. If a node is listed clearly stronger than the joined one, the board can hear it but didn't join it, which usually means the mesh steered it away (check the router's band/client steering, and the serial log at boot for the `Reason:` it was refused with). If the joined node is the strongest listed, the board is on its best AP and only moving the board or the node will help. Add `all=1` to list every network. The scan takes a few seconds and takes the radio off-channel briefly, so repeater clients see a short pause; it returns 503 while a background reconnect scan is running.
 
 ### Battery monitoring (optional, compile-time)
 
