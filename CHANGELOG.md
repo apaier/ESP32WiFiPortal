@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `GET /api/scan` lists every access point the board can hear for its network, strongest first, with BSSID, RSSI, channel, security and which one it's joined to (`all=1` for every network). For diagnosing a board that joins a weaker mesh node: it shows whether the board hears a stronger one at all.
+
 ## 0.4.3 - 2026-11-17
 
 - Fixed a dropped connection never being recovered when the Arduino core stopped retrying (#9). The core only auto-reconnects for a fixed list of disconnect reasons; after others, such as 34 `MISSING_ACKS` from a briefly blocked weak link, it gives up after one event, and the library waited forever for its tenth. The library now also times the outage: if the link stays down for 2 minutes while joined, it falls back to the setup AP (recorded as "link down too long") and scan-and-reconnect takes over.

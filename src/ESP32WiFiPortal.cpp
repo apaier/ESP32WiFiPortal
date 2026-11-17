@@ -1,5 +1,8 @@
 #include "ESP32WiFiPortal.h"
 
+#include <algorithm>
+#include <vector>
+
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
@@ -96,6 +99,21 @@ String jsonString(const String& s) {
     }
     out += '"';
     return out;
+}
+
+const char* authModeName(wifi_auth_mode_t mode) {
+    switch (mode) {
+        case WIFI_AUTH_OPEN: return "open";
+        case WIFI_AUTH_WEP: return "WEP";
+        case WIFI_AUTH_WPA_PSK: return "WPA";
+        case WIFI_AUTH_WPA2_PSK: return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Enterprise";
+        case WIFI_AUTH_WPA3_PSK: return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+        case WIFI_AUTH_OWE: return "OWE";
+        default: return "other";
+    }
 }
 
 uint32_t ipToU32(const IPAddress& ip) {
@@ -1300,12 +1318,69 @@ void ESP32WiFiPortal::handleStatusJson() {
     _server.send(200, "application/json", json);
 }
 
+// GET /api/scan lists every access point the board can hear for the
+// saved network (or the joined one), strongest first, as the board sees
+// it on 2.4 GHz: BSSID, RSSI, channel and security. all=1 lists every
+// network. For finding out why it joined a given AP when several share
+// the SSID. Scans synchronously (a few seconds, briefly off-channel).
+void ESP32WiFiPortal::handleScanJson() {
+    if (_scanInFlight) {
+        _server.send(503, "application/json",
+                     "{\"error\":\"background scan in progress; retry in a few seconds\"}");
+        return;
+    }
+    bool all = _server.arg("all") == "1";
+    bool joined = _mode != WiFiPortalMode::AccessPoint && WiFi.status() == WL_CONNECTED;
+    String ssid = joined ? WiFi.SSID() : loadSavedSsid();
+    if (ssid.length() == 0) all = true;
+    String joinedBssid = joined ? WiFi.BSSIDstr() : String();
+
+    uint32_t started = millis();
+    int count = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+    uint32_t tookMs = millis() - started;
+    if (count < 0) {
+        _server.send(500, "application/json", "{\"error\":\"scan failed\"}");
+        return;
+    }
+
+    // Indices sorted strongest first.
+    std::vector<int> order;
+    for (int i = 0; i < count; ++i) {
+        if (all || WiFi.SSID(i) == ssid) order.push_back(i);
+    }
+    std::sort(order.begin(), order.end(),
+              [](int a, int b) { return WiFi.RSSI(a) > WiFi.RSSI(b); });
+
+    String json = "{\"ssid\":" + (all ? String("null") : jsonString(ssid));
+    json += ",\"joined_bssid\":" + (joined ? jsonString(joinedBssid) : String("null"));
+    json += ",\"joined_rssi\":" + (joined ? String(WiFi.RSSI()) : String("null"));
+    json += ",\"scan_ms\":" + String(tookMs);
+    json += ",\"aps\":[";
+    for (size_t n = 0; n < order.size(); ++n) {
+        int i = order[n];
+        String bssid = WiFi.BSSIDstr(i);
+        if (n > 0) json += ",";
+        json += "{";
+        if (all) json += "\"ssid\":" + jsonString(WiFi.SSID(i)) + ",";
+        json += "\"bssid\":" + jsonString(bssid);
+        json += ",\"rssi\":" + String(WiFi.RSSI(i));
+        json += ",\"channel\":" + String(WiFi.channel(i));
+        json += ",\"auth\":\"" + String(authModeName(WiFi.encryptionType(i))) + "\"";
+        json += ",\"joined\":" + String(joined && bssid == joinedBssid ? "true" : "false");
+        json += "}";
+    }
+    json += "]}";
+    WiFi.scanDelete();
+    _server.send(200, "application/json", json);
+}
+
 void ESP32WiFiPortal::registerPages() {
     if (_pagesRegistered) return;
     auto handler = [this]() { this->handleConfigPage(); };
     _server.on("/", handler);
     _server.on("/wifi", handler);
     _server.on("/api/status", HTTP_GET, [this]() { this->handleStatusJson(); });
+    _server.on("/api/scan", HTTP_GET, [this]() { this->handleScanJson(); });
     _server.on("/api/hostname", HTTP_POST, [this]() { this->handleHostname(); });
     if (_bootLogEnabled) {
         _server.on("/api/bootlog", HTTP_GET, [this]() { this->handleBootLog(); });

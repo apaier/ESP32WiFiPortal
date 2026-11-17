@@ -231,6 +231,7 @@ private:
     void handleCaptiveRedirect();
     void handleBootLog();
     void handleStatusJson();
+    void handleScanJson();
     String batteryStatusText() const;
 #ifdef ESP32WIFIPORTAL_BATTERY
     void loadSavedBatteryCalibration();
