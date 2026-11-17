@@ -62,13 +62,18 @@ Machine-readable endpoints live under `/api/`; the setup page stays at `/`. Like
 
 ```json
 {"hostname":"esp32-portal","mode":"repeater","uptime_s":86412,"ip":"192.168.1.42",
- "ssid":"HomeNet","rssi":-58,"internet":true,"ap_ssid":"HomeNet-ext","ap_clients":2,
+ "ssid":"HomeNet","rssi":-58,"bssid":"A4:2B:B0:11:22:33","channel":6,"link_down_s":null,
+ "internet":true,"ap_ssid":"HomeNet-ext","ap_clients":2,
  "last_fallback":{"cause":"auth/handshake failure (4WAY_HANDSHAKE_TIMEOUT)","reason":15,
-   "uptime_s":402311,"this_boot":false,"count":3},"offline_reboots":0,"retry_in_s":null,
+   "uptime_s":402311,"this_boot":false,"count":3},
+ "last_disconnect":{"reason":200,"reason_name":"BEACON_TIMEOUT","uptime_s":80211,"count":2},
+ "offline_reboots":0,"retry_in_s":null,
  "battery":{"volts":15.82,"percent":72,"cells":4,"calibration":1.0180}}
 ```
 
 `mode` is `ap`, `client` or `repeater`. `ssid` / `rssi` are `null` when not joined to a network, `ap_ssid` / `ap_clients` are `null` when no AP is running, and `internet` is `null` unless the status LED (and so the internet probe) is enabled. `battery` is present only in builds with battery monitoring, and is `null` if it isn't configured.
+
+`bssid` and `channel` identify the access point the board is joined to, for networks where several share the SSID (mesh nodes, extenders); both are `null` when not joined. `link_down_s` is how long the upstream link has been down while the board is meant to be joined, otherwise `null`; after 2 minutes the board falls back to the setup AP and starts looking for the network again. `last_disconnect` is the most recent disconnect seen while joined, since boot: the WiFi `reason` code, its `reason_name`, the uptime when it happened and a running `count`; `null` until one happens.
 
 `last_fallback` records the most recent time the device lost its saved network and dropped to the setup AP: why, the WiFi disconnect `reason` code, the uptime when it happened, whether it was during this boot, and a running `count`. It's kept in NVS, so it survives a power cycle; it is `null` if that has never happened. `offline_reboots` counts the reboots the device has done after an hour stuck offline. `retry_in_s` is the time until the next reconnect attempt after an auth/handshake failure, otherwise `null`. When the device is in AP mode, the setup page's status line shows the same cause and retry time.
 

@@ -160,6 +160,7 @@ private:
         HardFail = 1,
         SoftFail = 2,
         BootConnectFailed = 3,
+        LinkDownTimeout = 4,  // link stayed down; see kLinkDownBeforeFallbackMs
     };
     struct FallbackRecord {
         uint8_t cause;
@@ -176,6 +177,19 @@ private:
     // Written by the WiFi event task, read by loop().
     volatile bool _disconnectEventPending;
     volatile uint8_t _disconnectReason;
+    // Station link down since _staDownSinceMs: set on STA_DISCONNECTED or
+    // STA_LOST_IP, cleared on STA_GOT_IP. Written only by the event task.
+    volatile bool _staDown;
+    volatile uint32_t _staDownSinceMs;
+    // Backstop for a drop no event reported: WiFi.status() not connected
+    // since _statusDownSinceMs. Written only by loop().
+    bool _statusDown;
+    uint32_t _statusDownSinceMs;
+    // Last disconnect while joined, for /api/status. RAM only.
+    bool _haveLastDisconnect;
+    uint8_t _lastDisconnectReason;
+    uint32_t _lastDisconnectUptimeS;
+    uint32_t _disconnectCount;
 
     bool ensurePreferences();
     bool haveSavedCredentials();
@@ -192,6 +206,7 @@ private:
     void recordFallback(FallbackCause cause, uint8_t reason);
     String fallbackText() const;
     void rebootWhileOffline();
+    bool linkDown(uint32_t* sinceMs) const;
     String loadSavedSsid();
     void attemptReconnect();
     void startAccessPoint();

@@ -23,6 +23,12 @@ constexpr uint32_t kHardFailBackoffMaxMs = 30UL * 60UL * 1000UL;
 // Last resort: reboot after this long in AP mode with saved credentials
 // and nobody on the portal, in case the radio or stack is wedged.
 constexpr uint32_t kOfflineRebootMs = 60UL * 60UL * 1000UL;
+// Fall back to AP if the station link stays down this long while joined,
+// however many disconnect events arrive. The Arduino core only retries a
+// fixed list of disconnect reasons; after any other one (e.g. 34
+// MISSING_ACKS, 209 SA_QUERY_TIMEOUT) it stops for good, so the
+// soft-fail event count alone can wait forever (issue #9).
+constexpr uint32_t kLinkDownBeforeFallbackMs = 2UL * 60UL * 1000UL;
 constexpr const char* kPrefsNamespace = "wifi_portal";
 constexpr const char* kPrefNetworkKey = "network";
 constexpr const char* kPrefPasswordKey = "password";
@@ -149,7 +155,15 @@ ESP32WiFiPortal::ESP32WiFiPortal(uint16_t port)
       _bootAfterOfflineReboot(false),
       _eventsRegistered(false),
       _disconnectEventPending(false),
-      _disconnectReason(0) {}
+      _disconnectReason(0),
+      _staDown(false),
+      _staDownSinceMs(0),
+      _statusDown(false),
+      _statusDownSinceMs(0),
+      _haveLastDisconnect(false),
+      _lastDisconnectReason(0),
+      _lastDisconnectUptimeS(0),
+      _disconnectCount(0) {}
 
 void ESP32WiFiPortal::begin(const String& accessPointName,
                             const String& accessPointPassword) {
@@ -226,14 +240,48 @@ void ESP32WiFiPortal::loop() {
         handleDisconnectEvent();
     }
 
+    bool joined = (_mode == WiFiPortalMode::Connected || _mode == WiFiPortalMode::Repeating);
+    if (joined) {
+        // The core sets WL_CONNECTED only on GOT_IP and clears it on most
+        // disconnects, so this catches a drop no event reached us for.
+        bool statusUp = WiFi.status() == WL_CONNECTED;
+        if (statusUp) {
+            _statusDown = false;
+        } else if (!_statusDown) {
+            _statusDown = true;
+            _statusDownSinceMs = millis();
+        }
+        uint32_t since;
+        if (linkDown(&since)) {
+            // The offline-reboot clock starts at the drop, not at the AP
+            // fallback, so it also covers a link that never recovers.
+            if (!_offline) {
+                _offline = true;
+                _offlineSinceMs = since;
+            }
+            if ((millis() - since) >= kLinkDownBeforeFallbackMs) {
+                Serial.printf("[ESP32WiFiPortal] Link down for %lu s; to AP\n",
+                              (unsigned long)((millis() - since) / 1000UL));
+                recordFallback(FallbackCause::LinkDownTimeout, _disconnectReason);
+                startAccessPoint();
+            }
+        } else if (_offline) {
+            Serial.printf("[ESP32WiFiPortal] Link back after %lu s\n",
+                          (unsigned long)((millis() - _offlineSinceMs) / 1000UL));
+            _offline = false;
+        }
+    }
+
     bool inApMode = (_mode == WiFiPortalMode::AccessPoint);
     bool haveCreds = haveSavedCredentials();
-    // Reconnect attempts take the AP down for up to 30 s, so hold off
-    // while someone is on the portal.
-    if (inApMode && haveCreds && !_scanInFlight && WiFi.softAPgetStationNum() == 0) {
-        if (_offline && (millis() - _offlineSinceMs) >= kOfflineRebootMs) {
-            rebootWhileOffline();
-        }
+    // Someone on the setup portal holds off anything that would take the
+    // AP down: reconnect attempts (up to 30 s) and the offline reboot.
+    bool portalInUse = inApMode && WiFi.softAPgetStationNum() > 0;
+    if (_offline && haveCreds && !portalInUse &&
+        (millis() - _offlineSinceMs) >= kOfflineRebootMs) {
+        rebootWhileOffline();
+    }
+    if (inApMode && haveCreds && !_scanInFlight && !portalInUse) {
         if (_hardFail) {
             if ((millis() - _hardFailSinceMs) >= _hardFailBackoffMs) {
                 Serial.println("[ESP32WiFiPortal] Hard-fail backoff elapsed; retrying");
@@ -464,18 +512,27 @@ void ESP32WiFiPortal::registerWiFiEvents() {
                 _internetOk = false;
                 _disconnectReason = info.wifi_sta_disconnected.reason;
                 _disconnectEventPending = true;
+                if (!_staDown) {
+                    _staDownSinceMs = millis();
+                    _staDown = true;
+                }
                 if (_mode == WiFiPortalMode::Repeating) {
                     WiFi.AP.enableNAPT(false);
                 }
                 break;
             case ARDUINO_EVENT_WIFI_STA_LOST_IP:
                 _internetOk = false;
+                if (!_staDown) {
+                    _staDownSinceMs = millis();
+                    _staDown = true;
+                }
                 if (_mode == WiFiPortalMode::Repeating) {
                     WiFi.AP.enableNAPT(false);
                 }
                 break;
             case ARDUINO_EVENT_WIFI_STA_GOT_IP:
                 _softFailEventCount = 0;
+                _staDown = false;
                 if (_probeTask != nullptr) xTaskNotifyGive(_probeTask);
                 if (_mode == WiFiPortalMode::Repeating) {
                     // Force-reset NAPT: an enabled-but-stuck NAT table
@@ -524,6 +581,10 @@ void ESP32WiFiPortal::handleDisconnectEvent() {
         return;
     }
     uint8_t reason = _disconnectReason;
+    _haveLastDisconnect = true;
+    _lastDisconnectReason = reason;
+    _lastDisconnectUptimeS = (uint32_t)(esp_timer_get_time() / 1000000LL);
+    _disconnectCount++;
     if (isHardFailReason(reason)) {
         Serial.printf("[ESP32WiFiPortal] Hard-fail disconnect (reason %u); to AP\n",
                       reason);
@@ -534,10 +595,12 @@ void ESP32WiFiPortal::handleDisconnectEvent() {
         startAccessPoint();
         return;
     }
-    // Soft fail: the chip's auto-reconnect is now busy retrying. We can't
-    // usefully scan while it's in that state (esp_wifi_scan_start is
-    // rejected), so we just count consecutive failed attempts. A successful
-    // STA_GOT_IP resets the counter from the event handler.
+    // Soft fail: the core's auto-reconnect is usually busy retrying now. We
+    // can't usefully scan while it's in that state (esp_wifi_scan_start is
+    // rejected), so we count consecutive failed attempts. A successful
+    // STA_GOT_IP resets the counter from the event handler. The core only
+    // retries some reasons, so loop() also times the outage and falls back
+    // after kLinkDownBeforeFallbackMs whatever the count.
     _softFailEventCount++;
     Serial.printf("[ESP32WiFiPortal] Soft-fail disconnect (reason %u, %u/%u)\n",
                   reason, _softFailEventCount,
@@ -590,6 +653,7 @@ String ESP32WiFiPortal::fallbackText() const {
         case FallbackCause::HardFail: text = "auth/handshake failure"; break;
         case FallbackCause::SoftFail: text = "repeated disconnects"; break;
         case FallbackCause::BootConnectFailed: text = "couldn't join at boot"; break;
+        case FallbackCause::LinkDownTimeout: text = "link down too long"; break;
         default: return String();
     }
     if (_lastFallback.reason != 0) {
@@ -597,6 +661,25 @@ String ESP32WiFiPortal::fallbackText() const {
                 WiFi.disconnectReasonName((wifi_err_reason_t)_lastFallback.reason) + ")";
     }
     return text;
+}
+
+// True while joined and the station link is down; *sinceMs gets the
+// earlier of the event- and status-based start times.
+bool ESP32WiFiPortal::linkDown(uint32_t* sinceMs) const {
+    if (_mode == WiFiPortalMode::AccessPoint) return false;
+    bool down = false;
+    uint32_t now = millis();
+    uint32_t longest = 0;
+    if (_staDown) {
+        down = true;
+        longest = now - _staDownSinceMs;
+    }
+    if (_statusDown) {
+        down = true;
+        longest = max(longest, now - _statusDownSinceMs);
+    }
+    if (down && sinceMs != nullptr) *sinceMs = now - longest;
+    return down;
 }
 
 void ESP32WiFiPortal::rebootWhileOffline() {
@@ -809,6 +892,8 @@ bool ESP32WiFiPortal::tryConnect(const String& network, const String& password,
     // before its own retry succeeded. That disconnect event is stale now;
     // left pending, loop() would treat it as a fresh drop and fall back.
     _disconnectEventPending = false;
+    _staDown = false;
+    _statusDown = false;
     _hardFail = false;
     _hardFailBackoffMs = 0;
     if (_offline) {
@@ -1163,6 +1248,12 @@ void ESP32WiFiPortal::handleStatusJson() {
     json += ",\"ip\":" + jsonString(getIP().toString());
     json += ",\"ssid\":" + (staUp ? jsonString(WiFi.SSID()) : String("null"));
     json += ",\"rssi\":" + (staUp ? String(WiFi.RSSI()) : String("null"));
+    // Which access point, when several share the SSID (mesh, extenders).
+    json += ",\"bssid\":" + (staUp ? jsonString(WiFi.BSSIDstr()) : String("null"));
+    json += ",\"channel\":" + (staUp ? String(WiFi.channel()) : String("null"));
+    uint32_t downSince;
+    json += ",\"link_down_s\":" +
+            (linkDown(&downSince) ? String((millis() - downSince) / 1000UL) : String("null"));
     // Only known when the LED's internet probe is running.
     json += ",\"internet\":" +
             String(_probeTask == nullptr ? "null" : (_internetOk ? "true" : "false"));
@@ -1176,6 +1267,15 @@ void ESP32WiFiPortal::handleStatusJson() {
         json += ",\"count\":" + String(_lastFallback.count) + "}";
     } else {
         json += ",\"last_fallback\":null";
+    }
+    if (_haveLastDisconnect) {
+        json += ",\"last_disconnect\":{\"reason\":" + String(_lastDisconnectReason);
+        json += ",\"reason_name\":" +
+                jsonString(WiFi.disconnectReasonName((wifi_err_reason_t)_lastDisconnectReason));
+        json += ",\"uptime_s\":" + String(_lastDisconnectUptimeS);
+        json += ",\"count\":" + String(_disconnectCount) + "}";
+    } else {
+        json += ",\"last_disconnect\":null";
     }
     json += ",\"offline_reboots\":" + String(_offlineReboots);
     if (_mode == WiFiPortalMode::AccessPoint && _hardFail) {
