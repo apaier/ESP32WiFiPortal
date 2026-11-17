@@ -55,6 +55,10 @@ Transitions in plain English:
   erase the chip's auto-reconnect credentials so it stops
   auto-reassociating with bad creds. The library's own Preferences
   entries are preserved so the portal can prefill for editing.
+- **Connected/Repeating → AP mode (link-down timeout)** — the station
+  link has been down for `kLinkDownBeforeFallbackMs` (2 minutes),
+  however many disconnect events arrived. See "Why the event count isn't
+  enough" below.
 - **Connected/Repeating → AP mode (soft-fail)** — disconnect events with
   transient reasons (BEACON_TIMEOUT, NO_AP_FOUND, etc.) are counted.
   Each event increments `_softFailEventCount`. A successful `STA_GOT_IP`
@@ -69,6 +73,51 @@ Transitions in plain English:
 - **AP mode → reboot** — saved credentials, no portal clients, and no
   successful join for `kOfflineRebootMs` (1 hour). Last resort for a
   wedged radio or stack.
+
+## Why the event count isn't enough
+
+The soft-fail count assumes the chip keeps retrying, producing a
+disconnect event every few seconds. It doesn't always. The retrying is
+done by the Arduino core's STA event handler (`STA.cpp`,
+`_is_staReconnectableReason`), and it only retries a fixed list of
+reasons. After any other reason it logs the disconnect once and stops
+for good. Reasons a weak or briefly blocked link can produce that are
+**not** on that list include 34 `MISSING_ACKS` (the AP drops a station
+that stopped acknowledging), 209 `SA_QUERY_TIMEOUT` (PMF), 39 `TIMEOUT`,
+47 `AP_INITIATED` and 4 `DISASSOC_DUE_TO_INACTIVITY`. One such event
+counts 1 of 10 and nothing follows.
+
+Issue #9 is this in the field: a client-mode board at -70 dBm lost its
+link when someone stood beside it, never fell back to AP, never hit the
+offline reboot, and sat off the network for 39 minutes until it was
+power-cycled.
+
+So `loop()` also times the outage. The link counts as down from the
+earlier of two signals, each with a single writer:
+
+- `_staDown` / `_staDownSinceMs`: set by the event handler on
+  `STA_DISCONNECTED` or `STA_LOST_IP`, cleared on `STA_GOT_IP`.
+- `_statusDown` / `_statusDownSinceMs`: set by `loop()` while
+  `WiFi.status() != WL_CONNECTED`, cleared when it is. The core sets
+  `WL_CONNECTED` only on `GOT_IP` and clears it on most disconnects, so
+  this catches a drop no event reported. (Reason 2 `AUTH_EXPIRE` and a
+  bare `LOST_IP` leave the status alone; the event signal covers those.)
+
+`tryConnect` clears both on success. Once the link has been down for
+`kLinkDownBeforeFallbackMs`, `loop()` records a `LinkDownTimeout`
+fallback and calls `startAccessPoint()`; scan-and-pounce then reconnects
+within about `kScanCadenceMs`. We deliberately don't re-implement the
+core's retry list to reconnect sooner: it changes between core versions,
+and the timer works whatever the core does.
+
+## Offline reboot
+
+`_offline` / `_offlineSinceMs` start when the link drops (or when AP
+mode starts, for boot failures), not when AP mode starts, and are
+cleared on the next successful join or `GOT_IP`. After
+`kOfflineRebootMs` (1 hour) with saved credentials and nobody on the
+setup portal, the device reboots. Devices on a repeater's own network
+don't hold it off; they have no upstream either.
 
 ## Why we don't scan from the Connected side
 
@@ -176,12 +225,17 @@ the device with neither an AP nor a connection.
 ## Fallback diagnostics
 
 Each fallback to AP with saved credentials (hard fail, soft-fail
-threshold, or failing to join at boot) is written to NVS as
+threshold, link-down timeout, or failing to join at boot) is written to NVS as
 `last_fall` (cause, disconnect reason, uptime, running count), and the
 offline-reboot count as `off_rbts`. Both appear in `/api/status`, and
 the AP-mode status line on the setup page shows the cause and retry
 time. Boot failures after an offline reboot aren't recorded (flagged by
 `rbt_pend`), so the original cause isn't overwritten.
+
+`/api/status` also reports, in RAM since boot, `last_disconnect` (the
+last disconnect reason seen while joined, its name, the uptime and a
+count) so an outage that recovers on its own still leaves its reason,
+and `link_down_s` while the link is down.
 
 ## Auto-reconnect lifecycle
 
@@ -318,6 +372,7 @@ All in the anonymous namespace at the top of `ESP32WiFiPortal.cpp`:
 | `kScanCadenceMs`                  | 30s     | How often to scan in AP mode looking for the saved SSID. Lower = faster recovery, more AP disruption. |
 | `kScanTimeoutMs`                  | 15s     | How long to wait before declaring an in-flight scan stuck. |
 | `kBlindRetryFloorMs`              | 15min   | Blind reconnect cadence (hidden SSIDs / DFS). |
+| `kLinkDownBeforeFallbackMs`       | 2min    | How long the station link may stay down while joined before falling back to AP, regardless of event count. Well past auto-reconnect's normal recovery. |
 | `kSoftFailEventsBeforeFallback`   | 10      | Consecutive soft-fail disconnect events before falling back from Connected/Repeating to AP. With chip auto-reconnect on, events arrive every few seconds — so 10 ≈ 30-60 seconds of confirmed failure. |
 | `kHardFailBackoffFirstMs`         | 2min    | First retry delay after an auth/handshake failure. Doubles per consecutive hard fail. |
 | `kHardFailBackoffMaxMs`           | 30min   | Cap on that backoff. |

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a dropped connection never being recovered when the Arduino core stopped retrying (#9). The core only auto-reconnects for a fixed list of disconnect reasons; after others, such as 34 `MISSING_ACKS` from a briefly blocked weak link, it gives up after one event, and the library waited forever for its tenth. The library now also times the outage: if the link stays down for 2 minutes while joined, it falls back to the setup AP (recorded as "link down too long") and scan-and-reconnect takes over.
+- The 1-hour offline reboot now counts from when the link drops, so it also covers a link that never recovers in client or repeater mode. Previously it only ran once the device was in AP mode.
+- `/api/status` adds `bssid` and `channel` (which access point the board is on), `link_down_s` while the link is down, and `last_disconnect` (reason, name, uptime and count since boot), so an outage that recovers on its own still shows why it happened.
+
 ## 0.4.2 - 2026-11-09
 
 - Auth/handshake failures on the saved network no longer leave the device in AP mode until rebooted. `AUTH_FAIL`, `ASSOC_FAIL`, `HANDSHAKE_TIMEOUT` and `4WAY_HANDSHAKE_TIMEOUT` also happen transiently (router rebooting, weak signal), so the device now retries after 2 minutes, doubling up to 30 minutes, instead of waiting for a form submission. Seen in the field as a repeater stuck on slow blink until power-cycled.
