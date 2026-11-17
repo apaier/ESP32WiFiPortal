@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 - 2026-11-17
 
 - Fixed a dropped connection never being recovered when the Arduino core stopped retrying (#9). The core only auto-reconnects for a fixed list of disconnect reasons; after others, such as 34 `MISSING_ACKS` from a briefly blocked weak link, it gives up after one event, and the library waited forever for its tenth. The library now also times the outage: if the link stays down for 2 minutes while joined, it falls back to the setup AP (recorded as "link down too long") and scan-and-reconnect takes over.
 - The 1-hour offline reboot now counts from when the link drops, so it also covers a link that never recovers in client or repeater mode. Previously it only ran once the device was in AP mode.
